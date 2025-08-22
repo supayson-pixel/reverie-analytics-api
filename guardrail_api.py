@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # -----------------------------
 # App & CORS
 # -----------------------------
-app = FastAPI(title="Reverie Analytics API", version="1.0.1")
+app = FastAPI(title="Reverie Analytics API", version="1.0.2")
 
 ALLOW_ORIGINS = [
     "https://www.reveriesun.com",
@@ -23,7 +23,7 @@ ALLOW_ORIGINS = [
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,  # set to ["*"] temporarily if you ever need to debug CORS
+    allow_origins=ALLOW_ORIGINS,      # set to ["*"] temporarily if you need to debug CORS
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -50,7 +50,6 @@ def _repair_packed_csv(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         return None
 
     hdr = str(df.columns[0]).strip().strip('"').strip("'")
-    # If the header doesn't contain a likely delimiter, nothing to do.
     delims_in_header = [d for d in CANDIDATE_DELIMS if d in hdr]
     if not delims_in_header:
         return None
@@ -59,21 +58,19 @@ def _repair_packed_csv(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if df.shape[1] == 2 and not df.iloc[:, 1].isna().all():
         return None
 
-    # Choose a delimiter: whichever appears most often in the header
+    # Choose delimiter with highest count in header
     delim = max(delims_in_header, key=lambda d: hdr.count(d))
     cols = [c.strip().strip('"').strip("'") for c in hdr.split(delim)]
 
-    # Split the single "packed" column into parts
     s = df.iloc[:, 0].astype(str).str.rstrip(delim)
     parts = s.str.split(delim, expand=True)
 
-    # If we got an extra empty column at the end, drop it
+    # Drop trailing empty column if present
     if parts.shape[1] > 1 and parts.iloc[:, -1].replace("", pd.NA).isna().all():
         parts = parts.iloc[:, :-1]
 
     # Match header length to parts
     if len(cols) < parts.shape[1]:
-        # pad headers
         cols = cols + [f"col_{i}" for i in range(len(cols), parts.shape[1])]
     elif len(cols) > parts.shape[1]:
         cols = cols[:parts.shape[1]]
@@ -148,6 +145,34 @@ def load_dataframe_from_bytes(filename: str, raw_bytes: bytes) -> pd.DataFrame:
     # Treat .txt like CSV
     return read_csv_robust(raw_bytes)
 
+# ---------- NEW: make object columns numeric/datetime when possible ----------
+def coerce_types(df: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
+    """
+    For object columns:
+      1) Try numeric: strip '$', commas, and other symbols; to_numeric (coerce).
+         If >= threshold of non-null parses, keep as numeric.
+      2) Else try datetime: to_datetime (coerce). If >= threshold non-null, keep.
+    """
+    df = df.copy()
+    for col in df.columns:
+        if pd.api.types.is_object_dtype(df[col]):
+            s = df[col].astype(str)
+
+            # try numeric
+            s_clean = s.str.replace(r"[^\d\.\-]", "", regex=True).replace("", pd.NA)
+            num = pd.to_numeric(s_clean, errors="coerce")
+            if num.notna().mean() >= threshold:
+                df[col] = num
+                continue
+
+            # try datetime
+            dt = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+            if dt.notna().mean() >= threshold:
+                df[col] = dt
+
+    return df
+# ---------------------------------------------------------------------------
+
 
 def numeric_summary(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     num = df.select_dtypes(include="number")
@@ -215,6 +240,7 @@ def profile_dataset(dataset_id: str = Query(..., alias="dataset_id")):
         raise HTTPException(status_code=404, detail="dataset_id not found")
     try:
         df = load_dataframe_from_bytes(item["filename"], item["bytes"])
+        df = coerce_types(df)   # <-- ensure amount is numeric, dates are datetime
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read dataset: {e}")
 
