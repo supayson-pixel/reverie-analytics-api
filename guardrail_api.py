@@ -1,270 +1,318 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Reverie Co — Lab</title>
-  <style>
-    :root {
-      --bg:#0b1220; --panel:#101a2c; --ink:#eaf1ff; --dim:#9fb1d0;
-      --brand1:#6fe1ff; --brand2:#6d7bff; --good:#19d39d; --bad:#ff6b6b;
-      --border:#20304b; --accent:#192540;
-    }
-    * { box-sizing: border-box; }
-    html, body { margin:0; padding:0; background:var(--bg); color:var(--ink);
-      font:16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; }
-    a { color: var(--brand1); text-decoration: none; }
-    .wrap { max-width: 1100px; margin: 42px auto; padding: 0 20px; }
-    h1 { margin: 0 0 12px; font-size: 36px; }
-    .crumb { margin-bottom: 20px; }
-    .panel { background:linear-gradient(180deg, #121d34, #0e1727); border:1px solid var(--border); border-radius:16px; padding:20px; }
-    .controls { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
-    input[type=file] { padding: 10px; background: var(--panel); border:1px solid var(--border); color:var(--ink); border-radius:10px; }
-    button {
-      border:0; color:#081225; font-weight:700; padding:12px 18px; border-radius:12px; cursor:pointer;
-      background:linear-gradient(90deg, var(--brand1), var(--brand2));
-    }
-    button.secondary { background:#1b2a46; color:var(--ink); border:1px solid var(--border); }
-    .hint { color:var(--dim); font-size:14px; }
-    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:12px; margin-top:12px; }
-    pre { white-space:pre-wrap; word-break:break-word; background: #0d1628; border:1px solid var(--border); padding:16px; border-radius:12px; }
-    .badge { display:inline-block; padding:2px 8px; background:#14203a; border:1px solid var(--border); border-radius:100px; color:var(--dim); font-size:12px; }
-    table { width:100%; border-collapse: collapse; }
-    th, td { padding:10px 8px; border-bottom:1px solid var(--border); text-align:left; }
-    .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-    .muted { color:var(--dim); }
-    .good { color:var(--good); }
-    .bad { color:var(--bad); }
-    .section { margin-top:22px; }
-    .sticky { position: sticky; top: 0; background: var(--bg); padding:8px 0 16px; z-index: 2; }
-    .right { margin-left:auto; }
-    code.copy { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; background:#0e1a2d; padding:4px 8px; border-radius:8px; border:1px solid var(--border); }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="crumb"><a href="/">&larr; Back to site</a></div>
-    <div class="sticky"><h1>Reverie Co — Lab</h1></div>
+# guardrail_api.py
+# Reverie Analytics API – clean + profile uploaded CSV/XLSX
+# v0.3.2
 
-    <div class="panel">
-      <div class="row" style="margin-bottom:10px">
-        <div class="badge">API</div>
-        <code class="copy" id="apiBase"></code>
-        <span class="muted">Upload a CSV/XLSX to get a <code>dataset_id</code>, then profile it.</span>
-      </div>
+from __future__ import annotations
 
-      <div class="controls">
-        <input id="file" type="file" accept=".csv,.xlsx,.xls,.txt" />
-        <button id="go">Upload &amp; Profile</button>
-        <button class="secondary" id="copyJson" title="Copy JSON" disabled>Copy JSON</button>
-        <button class="secondary" id="toggle" title="Show/Hide raw JSON" disabled>Toggle JSON</button>
-        <span class="hint" id="status">Waiting for upload…</span>
-      </div>
+import io
+import csv
+import re
+import uuid
+from typing import Dict, Any, List
 
-      <div class="section">
-        <div class="grid">
-          <div class="panel">
-            <div class="muted">dataset_id</div>
-            <div id="dsid" style="word-break: break-all">—</div>
-          </div>
-          <div class="panel">
-            <div class="muted">Shape</div>
-            <div id="shape">—</div>
-          </div>
-          <div class="panel">
-            <div class="muted">Columns</div>
-            <div id="columns">—</div>
-          </div>
-        </div>
-      </div>
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
-      <div class="section grid">
-        <div class="panel">
-          <div class="row"><strong>Nulls by column</strong></div>
-          <div id="nulls">—</div>
-        </div>
-        <div class="panel">
-          <div class="row"><strong>Top 5 categories</strong></div>
-          <div class="muted" style="margin:-6px 0 8px">Date-like columns are excluded.</div>
-          <div id="cats">—</div>
-        </div>
-      </div>
+# -----------------------------
+# FastAPI app + CORS
+# -----------------------------
+app = FastAPI(
+    title="Reverie Analytics API",
+    description="Upload a dataset, then profile it.",
+    version="0.3.2",
+)
 
-      <div class="section grid">
-        <div class="panel">
-          <div class="row"><strong>Numeric summary</strong></div>
-          <div id="nums">—</div>
-        </div>
-        <div class="panel">
-          <div class="row"><strong>Date summary</strong></div>
-          <div class="muted" style="margin:-6px 0 8px">Min/Max/Span + by month & by weekday.</div>
-          <div id="dates">—</div>
-        </div>
-      </div>
+# Keep CORS permissive while we finalize wiring. Lock down later for prod.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-      <div class="section panel">
-        <div class="row">
-          <strong>Raw JSON</strong>
-        </div>
-        <pre id="jsonBox" hidden>{"status":"waiting"}</pre>
-      </div>
-    </div>
-  </div>
+# -----------------------------
+# In-memory dataset store
+# -----------------------------
+_DATASETS: Dict[str, pd.DataFrame] = {}
 
-  <script>
-    // === Configure your live API here ===
-    const API_URL = "https://reverie-analytics-api.onrender.com";
-    // ====================================
+# -----------------------------
+# Robust CSV/Excel reading
+# -----------------------------
+def _looks_broken(df: pd.DataFrame) -> bool:
+    """Heuristic: 1 column only or one column has almost all data."""
+    if df is None or df.shape[0] == 0:
+        return True
+    if df.shape[1] == 1:
+        return True
+    nn = df.notna().mean()
+    return (nn.max() > 0.8) and ((nn < 0.2).sum() >= max(1, df.shape[1] - 1))
 
-    document.getElementById('apiBase').textContent = API_URL;
 
-    const $ = sel => document.querySelector(sel);
-    const statusEl = $('#status');
-    const fileEl = $('#file');
-    const goBtn = $('#go');
-    const copyBtn = $('#copyJson');
-    const toggleBtn = $('#toggle');
-    const jsonBox = $('#jsonBox');
+def _strip_quotes_everywhere(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip surrounding single/double quotes in headers & string cells."""
+    df = df.copy()
+    df.columns = [str(c).strip().strip('"').strip("'") for c in df.columns]
+    for col in df.columns:
+        if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
+            s = df[col].astype("string")
+            s = s.str.replace(r'^\s*("|\')', "", regex=True)
+            s = s.str.replace(r'("|\')\s*$', "", regex=True)
+            df[col] = s
+    return df
 
-    let lastProfile = null;
 
-    toggleBtn.addEventListener('click', () => {
-      jsonBox.hidden = !jsonBox.hidden;
-    });
+def _read_csv_text(text: str) -> pd.DataFrame:
+    """
+    Try several parsing strategies:
+      1) pandas sniffing (sep=None, engine='python')
+      2) force common separators: ',', '\t', ';', '|'
+      3) row-quoted CSVs: disable quoting so commas split, then strip quotes
+    """
+    # primary attempt: sniff
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+        if not _looks_broken(df):
+            return _strip_quotes_everywhere(df)
+    except Exception:
+        pass
 
-    copyBtn.addEventListener('click', () => {
-      if (!lastProfile) return;
-      navigator.clipboard.writeText(JSON.stringify(lastProfile, null, 2));
-      status('Copied JSON to clipboard ✔', 'good');
-    });
+    # common separators
+    for sep in [",", "\t", ";", "|"]:
+        try:
+            df2 = pd.read_csv(io.StringIO(text), sep=sep, engine="python")
+            if not _looks_broken(df2):
+                return _strip_quotes_everywhere(df2)
+        except Exception:
+            continue
 
-    goBtn.addEventListener('click', async () => {
-      try {
-        const f = fileEl.files?.[0];
-        if (!f) return status('Please choose a file first.', 'bad');
-        if (f.size > 25 * 1024 * 1024) return status('File too large (limit ~25 MB for demo).', 'bad');
+    # row-quoted CSV (whole line like "a,b,c")
+    try:
+        df3 = pd.read_csv(
+            io.StringIO(text),
+            sep=",",
+            engine="python",
+            quoting=csv.QUOTE_NONE,
+            escapechar="\\",
+        )
+        return _strip_quotes_everywhere(df3)
+    except Exception:
+        pass
 
-        status('Uploading… (cold starts can take a few seconds)');
-        goBtn.disabled = true;
+    # last resort
+    df_fallback = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+    return _strip_quotes_everywhere(df_fallback)
 
-        const form = new FormData();
-        form.append('file', f);
-        const up = await fetch(`${API_URL}/analytics/upload`, { method:'POST', body: form });
-        if (!up.ok) throw new Error(await up.text());
-        const meta = await up.json();
-        $('#dsid').textContent = meta.dataset_id || '—';
 
-        status('Profiling…');
-        const prof = await fetch(`${API_URL}/analytics/profile?dataset_id=${encodeURIComponent(meta.dataset_id)}`);
-        if (!prof.ok) throw new Error(await prof.text());
-        const data = await prof.json();
-        lastProfile = data;
-        copyBtn.disabled = false;
-        toggleBtn.disabled = false;
+def _read_dataframe_from_upload(file: UploadFile) -> pd.DataFrame:
+    name = (file.filename or "").lower()
 
-        // Fill summary boxes
-        $('#shape').textContent = data?.shape ? `${data.shape.rows} rows × ${data.shape.columns} cols` : '—';
-        $('#columns').textContent = data?.columns?.length ? data.columns.join(', ') : '—';
+    if name.endswith((".xlsx", ".xls")):
+        data = file.file.read()
+        df = pd.read_excel(io.BytesIO(data))
+        return _strip_quotes_everywhere(df)
 
-        // Nulls
-        $('#nulls').innerHTML = renderKVTable(data?.nulls || {}, 'Column', 'Nulls');
+    # CSV/TXT: decode robustly and remove BOM if present
+    raw = file.file.read()
+    try:
+        text = raw.decode("utf-8-sig", errors="replace")  # handles BOM
+    except Exception:
+        text = raw.decode("utf-8", errors="replace")
 
-        // Top categories (already excludes dates on the API)
-        $('#cats').innerHTML = Object.keys(data?.top5_categories || {}).length
-          ? Object.entries(data.top5_categories).map(([col, kv]) => `
-              <div style="margin:8px 0"><div class="muted">${escapeHtml(col)}</div>
-                ${renderKVTable(kv, 'Value', 'Count')}
-              </div>`).join('')
-          : '—';
+    return _read_csv_text(text)
 
-        // Numeric summary
-        $('#nums').innerHTML = renderNumericSummary(data?.numeric_summary || {});
+# -----------------------------
+# Cleaning / coercions
+# -----------------------------
+def to_numeric_clean(s: pd.Series) -> pd.Series:
+    """
+    Convert strings like '$1,234.56', '45%', '1 234', '(123)' to floats.
+    Keeps NaN where conversion fails. Vectorized.
+    """
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
 
-        // Date summary
-        $('#dates').innerHTML = renderDateSummary(data?.date_summary || {});
+    t = s.astype("string")
 
-        // Raw JSON
-        jsonBox.textContent = JSON.stringify(data, null, 2);
-        jsonBox.hidden = false;
+    has_percent = t.str.contains("%", regex=False, na=False)
 
-        status('Done ✔', 'good');
-      } catch (err) {
-        console.error(err);
-        status('Error: ' + (err?.message || err), 'bad');
-      } finally {
-        goBtn.disabled = false;
-      }
-    });
+    # remove everything except digits, signs, decimal sep, percent and parentheses
+    t = t.str.replace(r"[^0-9\-\.,%()]", "", regex=True)
 
-    function renderKVTable(obj, kLabel, vLabel) {
-      const rows = Object.entries(obj);
-      if (!rows.length) return '—';
-      return `<table>
-        <thead><tr><th>${kLabel}</th><th>${vLabel}</th></tr></thead>
-        <tbody>${rows.map(([k,v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(String(v))}</td></tr>`).join('')}</tbody>
-      </table>`;
-    }
+    # parentheses negatives
+    neg = t.str.contains(r"\(", regex=True, na=False) & t.str.contains(r"\)", regex=True, na=False)
+    t = t.str.replace(r"[()]", "", regex=True)
 
-    function renderNumericSummary(numSummary) {
-      const cols = Object.keys(numSummary || {});
-      if (!cols.length) return '—';
-      const wanted = ['count','mean','std','min','25%','50%','75%','max'];
-      return cols.map(c => {
-        const s = numSummary[c] || {};
-        return `<div style="margin:8px 0">
-          <div class="muted">${escapeHtml(c)}</div>
-          <table>
-            <thead><tr>${wanted.map(w => `<th>${w}</th>`).join('')}</tr></thead>
-            <tbody>
-              <tr>${wanted.map(w => `<td>${fmt(s[w])}</td>`).join('')}</tr>
-            </tbody>
-          </table>
-        </div>`;
-      }).join('');
-    }
+    both = t.str.contains(r"\.", regex=True, na=False) & t.str.contains(r",", regex=True, na=False)
+    t = t.mask(both, t.str.replace(",", "", regex=False))  # 1,234.56 -> 1234.56
 
-    function renderDateSummary(ds) {
-      const cols = Object.keys(ds || {});
-      if (!cols.length) return '—';
-      return cols.map(col => {
-        const d = ds[col] || {};
-        const meta = [
-          ['Min', d.min ?? '—'],
-          ['Max', d.max ?? '—'],
-          ['Span (days)', d.span_days ?? '—'],
-        ];
-        return `<div style="margin:8px 0">
-          <div class="muted">${escapeHtml(col)}</div>
-          <div class="grid">
-            <div class="panel">
-              <div class="muted">Range</div>
-              ${renderList(meta)}
-            </div>
-            <div class="panel">
-              <div class="muted">By month</div>
-              ${renderKVTable(d.by_month || {}, 'Month', 'Count')}
-            </div>
-            <div class="panel">
-              <div class="muted">By weekday</div>
-              ${renderKVTable(d.by_weekday || {}, 'Weekday', 'Count')}
-            </div>
-          </div>
-        </div>`;
-      }).join('');
-    }
+    comma_only = ~t.str.contains(r"\.", regex=True, na=False) & t.str.contains(r",", regex=True, na=False)
+    t = t.mask(comma_only, t.str.replace(",", ".", regex=False))  # 123,45 -> 123.45
 
-    function renderList(pairs){
-      return `<table>
-        <tbody>${pairs.map(([k,v]) => `<tr><td class="muted" style="width:140px">${k}</td><td>${escapeHtml(String(v))}</td></tr>`).join('')}</tbody>
-      </table>`;
-    }
+    t = t.str.replace("%", "", regex=False)
 
-    function fmt(x){
-      return (x === null || x === undefined || Number.isNaN(x)) ? '—'
-        : (typeof x === 'number' ? Number(x.toFixed(2)) : escapeHtml(String(x)));
-    }
-    function status(msg, mood){ statusEl.textContent = msg; statusEl.className = 'hint ' + (mood || ''); }
-    function escapeHtml(s){ return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
-  </script>
-</body>
-</html>
+    out = pd.to_numeric(t, errors="coerce")
+    out = out.where(~neg, -out)
+    out = out.where(~has_percent, out / 100.0)
+    return out
+
+
+def coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in df.columns:
+        s = df[col]
+        s_num = to_numeric_clean(s)
+        if pd.api.types.is_numeric_dtype(s):
+            df[col] = pd.to_numeric(s, errors="coerce")
+        else:
+            valid_ratio = s_num.notna().mean()
+            if valid_ratio >= 0.6:
+                df[col] = s_num
+    return df
+
+
+def detect_date_columns(df: pd.DataFrame) -> List[str]:
+    candidates: List[str] = []
+    for col in df.columns:
+        s = df[col]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            candidates.append(col)
+            continue
+        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+            parsed = pd.to_datetime(s, errors="coerce", utc=False)
+            if parsed.notna().mean() >= 0.6:
+                candidates.append(col)
+    return candidates
+
+
+def summarize_dates(df: pd.DataFrame, date_cols: List[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+    for col in date_cols:
+        dt = pd.to_datetime(df[col], errors="coerce", utc=False)
+        if dt.notna().sum() == 0:
+            continue
+
+        dmin = dt.min()
+        dmax = dt.max()
+        by_month = dt.dt.to_period("M").astype(str).value_counts().sort_index()
+        by_weekday = dt.dt.day_name().value_counts()
+        by_weekday = by_weekday.reindex(weekday_order, fill_value=0).astype(int)
+
+        out[col] = {
+            "min": dmin.strftime("%Y-%m-%d"),
+            "max": dmax.strftime("%Y-%m-%d"),
+            "span_days": int((dmax.normalize() - dmin.normalize()).days),
+            "by_month": by_month.to_dict(),
+            "by_weekday": by_weekday.to_dict(),
+        }
+    return out
+
+# -----------------------------
+# Profiling
+# -----------------------------
+def round2(x):
+    if pd.isna(x):
+        return None
+    if isinstance(x, (int, float)):
+        return int(x) if float(x).is_integer() else round(float(x), 2)
+    return x
+
+
+def numeric_summary(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    num_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    for col in num_cols:
+        s = pd.to_numeric(df[col], errors="coerce")
+        if s.notna().sum() == 0:
+            continue
+        q = s.quantile([0.25, 0.5, 0.75])
+        desc = {
+            "count": int(s.notna().sum()),
+            "mean": s.mean(),
+            "std": s.std(),
+            "min": s.min(),
+            "25%": q.get(0.25, None),
+            "50%": q.get(0.5, None),
+            "75%": q.get(0.75, None),
+            "max": s.max(),
+        }
+        out[col] = {k: round2(v) for k, v in desc.items()}
+    return out
+
+
+def top5_categories(df: pd.DataFrame, exclude_cols: List[str] | None = None) -> Dict[str, Dict[str, int]]:
+    exclude = set(exclude_cols or [])
+    out: Dict[str, Dict[str, int]] = {}
+    non_num_cols = df.select_dtypes(exclude=["number", "datetime"]).columns.tolist()
+    for col in non_num_cols:
+        if col in exclude:
+            continue
+        counts = df[col].astype("string").value_counts(dropna=True).head(5)
+        if len(counts) > 0:
+            out[col] = counts.to_dict()
+    return out
+
+
+def profile_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
+    # detect & coerce dates first, then numerics
+    date_cols = detect_date_columns(df)
+    for c in date_cols:
+        if not pd.api.types.is_datetime64_any_dtype(df[c]):
+            df[c] = pd.to_datetime(df[c], errors="coerce", utc=False)
+    df = coerce_numeric_columns(df)
+
+    result: Dict[str, Any] = {}
+    result["shape"] = {"rows": int(df.shape[0]), "columns": int(df.shape[1])}
+    result["columns"] = df.columns.astype(str).tolist()
+    result["nulls"] = {c: int(df[c].isna().sum()) for c in df.columns}
+    result["numeric_summary"] = numeric_summary(df)
+    result["date_summary"] = summarize_dates(df, date_cols)
+    result["top5_categories"] = top5_categories(df, exclude_cols=date_cols)
+    return result
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {"message": "Reverie Analytics API. Try /health or /analytics/*", "version": app.version}
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+@app.post("/analytics/upload")
+async def upload(file: UploadFile = File(...)) -> Dict[str, str]:
+    try:
+        df = _read_dataframe_from_upload(file)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+
+    if df is None or df.shape[0] == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file appears empty.")
+
+    dataset_id = str(uuid.uuid4())
+    _DATASETS[dataset_id] = df
+    return {"dataset_id": dataset_id}
+
+@app.get("/analytics/profile")
+def profile(dataset_id: str = Query(...)) -> Dict[str, Any]:
+    df = _DATASETS.get(dataset_id)
+    if df is None:
+        raise HTTPException(status_code=404, detail="dataset_id not found or expired")
+    try:
+        return profile_dataframe(df)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"profiling failed: {e}")
+
+# -----------------------------
+# Local dev (Render uses Start Command)
+# -----------------------------
+if __name__ == "__main__":
+    import uvicorn, os
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("guardrail_api:app", host="0.0.0.0", port=port, reload=True)
