@@ -1,6 +1,6 @@
 # guardrail_api.py
 # Reverie Analytics API – clean + profile uploaded CSV/XLSX
-# v0.3.2
+# v0.3.3
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(
     title="Reverie Analytics API",
     description="Upload a dataset, then profile it.",
-    version="0.3.2",
+    version="0.3.3",
 )
 
-# Keep CORS permissive while we finalize wiring. Lock down later for prod.
+# Keep CORS permissive during setup. Lock down later for prod.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,7 +42,6 @@ _DATASETS: Dict[str, pd.DataFrame] = {}
 # Robust CSV/Excel reading
 # -----------------------------
 def _looks_broken(df: pd.DataFrame) -> bool:
-    """Heuristic: 1 column only or one column has almost all data."""
     if df is None or df.shape[0] == 0:
         return True
     if df.shape[1] == 1:
@@ -52,7 +51,6 @@ def _looks_broken(df: pd.DataFrame) -> bool:
 
 
 def _strip_quotes_everywhere(df: pd.DataFrame) -> pd.DataFrame:
-    """Strip surrounding single/double quotes in headers & string cells."""
     df = df.copy()
     df.columns = [str(c).strip().strip('"').strip("'") for c in df.columns]
     for col in df.columns:
@@ -65,13 +63,6 @@ def _strip_quotes_everywhere(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _read_csv_text(text: str) -> pd.DataFrame:
-    """
-    Try several parsing strategies:
-      1) pandas sniffing (sep=None, engine='python')
-      2) force common separators: ',', '\t', ';', '|'
-      3) row-quoted CSVs: disable quoting so commas split, then strip quotes
-    """
-    # primary attempt: sniff
     try:
         df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
         if not _looks_broken(df):
@@ -79,7 +70,6 @@ def _read_csv_text(text: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # common separators
     for sep in [",", "\t", ";", "|"]:
         try:
             df2 = pd.read_csv(io.StringIO(text), sep=sep, engine="python")
@@ -88,7 +78,6 @@ def _read_csv_text(text: str) -> pd.DataFrame:
         except Exception:
             continue
 
-    # row-quoted CSV (whole line like "a,b,c")
     try:
         df3 = pd.read_csv(
             io.StringIO(text),
@@ -101,7 +90,6 @@ def _read_csv_text(text: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # last resort
     df_fallback = pd.read_csv(io.StringIO(text), sep=None, engine="python")
     return _strip_quotes_everywhere(df_fallback)
 
@@ -114,10 +102,9 @@ def _read_dataframe_from_upload(file: UploadFile) -> pd.DataFrame:
         df = pd.read_excel(io.BytesIO(data))
         return _strip_quotes_everywhere(df)
 
-    # CSV/TXT: decode robustly and remove BOM if present
     raw = file.file.read()
     try:
-        text = raw.decode("utf-8-sig", errors="replace")  # handles BOM
+        text = raw.decode("utf-8-sig", errors="replace")
     except Exception:
         text = raw.decode("utf-8", errors="replace")
 
@@ -127,10 +114,6 @@ def _read_dataframe_from_upload(file: UploadFile) -> pd.DataFrame:
 # Cleaning / coercions
 # -----------------------------
 def to_numeric_clean(s: pd.Series) -> pd.Series:
-    """
-    Convert strings like '$1,234.56', '45%', '1 234', '(123)' to floats.
-    Keeps NaN where conversion fails. Vectorized.
-    """
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_numeric(s, errors="coerce")
 
@@ -138,18 +121,16 @@ def to_numeric_clean(s: pd.Series) -> pd.Series:
 
     has_percent = t.str.contains("%", regex=False, na=False)
 
-    # remove everything except digits, signs, decimal sep, percent and parentheses
     t = t.str.replace(r"[^0-9\-\.,%()]", "", regex=True)
 
-    # parentheses negatives
     neg = t.str.contains(r"\(", regex=True, na=False) & t.str.contains(r"\)", regex=True, na=False)
     t = t.str.replace(r"[()]", "", regex=True)
 
     both = t.str.contains(r"\.", regex=True, na=False) & t.str.contains(r",", regex=True, na=False)
-    t = t.mask(both, t.str.replace(",", "", regex=False))  # 1,234.56 -> 1234.56
+    t = t.mask(both, t.str.replace(",", "", regex=False))
 
     comma_only = ~t.str.contains(r"\.", regex=True, na=False) & t.str.contains(r",", regex=True, na=False)
-    t = t.mask(comma_only, t.str.replace(",", ".", regex=False))  # 123,45 -> 123.45
+    t = t.mask(comma_only, t.str.replace(",", ".", regex=False))
 
     t = t.str.replace("%", "", regex=False)
 
@@ -258,7 +239,6 @@ def top5_categories(df: pd.DataFrame, exclude_cols: List[str] | None = None) -> 
 
 
 def profile_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
-    # detect & coerce dates first, then numerics
     date_cols = detect_date_columns(df)
     for c in date_cols:
         if not pd.api.types.is_datetime64_any_dtype(df[c]):
@@ -308,6 +288,36 @@ def profile(dataset_id: str = Query(...)) -> Dict[str, Any]:
         return profile_dataframe(df)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"profiling failed: {e}")
+
+@app.get("/analytics/preview")
+def preview(
+    dataset_id: str = Query(...),
+    limit: int = Query(10, ge=1, le=100),
+) -> Dict[str, Any]:
+    """
+    Return first N rows for a dataset_id for quick preview.
+    """
+    df = _DATASETS.get(dataset_id)
+    if df is None:
+        raise HTTPException(status_code=404, detail="dataset_id not found or expired")
+
+    sample = df.head(limit).copy()
+
+    # Format datetimes as ISO strings for the UI
+    for c in sample.columns:
+        if pd.api.types.is_datetime64_any_dtype(sample[c]):
+            sample[c] = pd.to_datetime(sample[c], errors="coerce", utc=False)
+            sample[c] = sample[c].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Replace NaN with None for JSON
+    sample = sample.where(pd.notna(sample), None)
+
+    return {
+        "columns": [str(c) for c in sample.columns],
+        "rows": sample.to_dict(orient="records"),
+        "limit": limit,
+        "total_rows": int(df.shape[0]),
+    }
 
 # -----------------------------
 # Local dev (Render uses Start Command)
