@@ -18,7 +18,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://www.reveriesun.com",
-        "https://reveriesun.netlify.app"
+        "https://reveriesun.netlify.app",
+        "https://inspiring-tarsier-97b2c7.netlify.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
