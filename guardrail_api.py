@@ -1,37 +1,25 @@
-# guardrail_api.py
-# Reverie Analytics API – clean + profile uploaded CSV/XLSX
-# v0.3.1
-
 from __future__ import annotations
 
 import io
+import re
 import uuid
-import csv
-from typing import Dict, Any, List
+from typing import Dict, List
 
+import numpy as np
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 # -----------------------------
 # FastAPI app + CORS
 # -----------------------------
-app = FastAPI(
-    title="Reverie Analytics API",
-    description="Upload a dataset, then profile it.",
-    version="0.3.1",
-)
+app = FastAPI(title="DAFE API")
 
-_CORS_ORIGINS = [
-    "https://www.reveriesun.com",
-    "https://reveriesun.com",
-    "https://reveriesun.netlify.app",
-    "https://inspiring-tarsier-97b2c7.netlify.app",
-]
+# For the demo, keep CORS permissive to avoid surprises between Netlify & Render.
+# If you want to lock down later, replace ["*"] with your exact origins.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_CORS_ORIGINS,
-    allow_origin_regex=r"https://.*\.netlify\.app",
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,277 +28,265 @@ app.add_middleware(
 # -----------------------------
 # In-memory dataset store
 # -----------------------------
-_DATASETS: Dict[str, pd.DataFrame] = {}
+DATASETS: Dict[str, pd.DataFrame] = {}
 
 # -----------------------------
-# Robust CSV/Excel reading
+# Helpers (read/clean/coerce)
 # -----------------------------
-def _looks_broken(df: pd.DataFrame) -> bool:
-    """Heuristic: one column has most data, others nearly empty (or only one column)."""
-    if df is None or df.shape[0] == 0:
-        return True
-    if df.shape[1] == 1:
-        return True
-    nn = df.notna().mean()
-    return (nn.max() > 0.8) and ((nn < 0.2).sum() >= max(1, df.shape[1] - 1))
 
+# Currency symbols & spaces; keep digits, minus, and decimal.
+_CURRENCY_CHARS = re.compile(r"[^\d\-\.\%\,\(\)\s]")
 
-def _strip_quotes_everywhere(df: pd.DataFrame) -> pd.DataFrame:
-    """Strip surrounding single/double quotes in headers & string cells."""
-    df = df.copy()
-    df.columns = [str(c).strip().strip('"').strip("'") for c in df.columns]
-    for col in df.columns:
-        if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
-            s = df[col].astype("string")
-            s = s.str.replace(r'^\s*("|\')', "", regex=True)
-            s = s.str.replace(r'("|\')\s*$', "", regex=True)
-            df[col] = s
-    return df
+def _sniff_delimiter(text: str) -> str:
+    # Gentle heuristic; prefer comma, then tab, then semicolon/pipe
+    candidates = [",", "\t", ";", "|"]
+    counts = {c: text.count(c) for c in candidates}
+    delim = max(counts, key=counts.get)
+    # if no delimiter found, default to comma
+    return delim if counts[delim] > 0 else ","
 
-
-def _read_csv_text(text: str) -> pd.DataFrame:
-    """
-    Try several parsing strategies:
-      1) pandas sniffing (sep=None, engine='python')
-      2) force common separators: ',', '\t', ';', '|'
-      3) row-quoted CSVs: quoting disabled so commas split, then strip quotes
-    """
-    # primary attempt: sniff
-    try:
-        df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
-        if not _looks_broken(df):
-            return _strip_quotes_everywhere(df)
-    except Exception:
-        pass
-
-    # common separators
-    for sep in [",", "\t", ";", "|"]:
-        try:
-            df2 = pd.read_csv(io.StringIO(text), sep=sep, engine="python")
-            if not _looks_broken(df2):
-                return _strip_quotes_everywhere(df2)
-        except Exception:
-            continue
-
-    # row-quoted CSV (whole line like "a,b,c")
-    # disable quoting to treat quotes as literal, then strip them
-    try:
-        df3 = pd.read_csv(
-            io.StringIO(text),
-            sep=",",
-            engine="python",
-            quoting=csv.QUOTE_NONE,
-            escapechar="\\",
-        )
-        return _strip_quotes_everywhere(df3)
-    except Exception:
-        pass
-
-    # last resort: return whatever we got via sniff; it might be 1 col with the whole line
-    df_fallback = pd.read_csv(io.StringIO(text), sep=None, engine="python")
-    return _strip_quotes_everywhere(df_fallback)
-
-
-def _read_dataframe_from_upload(file: UploadFile) -> pd.DataFrame:
+def _read_upload_to_df(file: UploadFile) -> pd.DataFrame:
     name = (file.filename or "").lower()
 
     if name.endswith((".xlsx", ".xls")):
-        data = file.file.read()
-        df = pd.read_excel(io.BytesIO(data))
-        return _strip_quotes_everywhere(df)
+        # Excel path
+        df = pd.read_excel(file.file)
+    else:
+        # CSV/TXT path
+        raw = file.file.read()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # Fallback commonly helps with Windows-1252 exports
+            text = raw.decode("latin-1")
 
-    # CSV/TXT: decode robustly and remove BOM if present
-    raw = file.file.read()
-    try:
-        text = raw.decode("utf-8-sig", errors="replace")  # handles BOM
-    except Exception:
-        text = raw.decode("utf-8", errors="replace")
+        delim = _sniff_delimiter(text)
+        df = pd.read_csv(io.StringIO(text), sep=delim, engine="python")
 
-    return _read_csv_text(text)
+    # Normalize column names: strip whitespace & wrapping quotes; drop fully-empty cols
+    df.columns = (
+        pd.Series(df.columns)
+        .astype("string")
+        .str.strip()
+        .str.replace(r'^["\']|["\']$', "", regex=True)
+        .str.replace(r"^Unnamed:.*", "", regex=True)
+    )
+    df = df.loc[:, df.columns.ne("")]            # remove columns that became empty after cleaning
+    df = df.dropna(axis=1, how="all")            # drop all-NaN columns
+    # trim whitespace for string-like columns
+    for c in df.columns:
+        if pd.api.types.is_object_dtype(df[c]) or pd.api.types.is_string_dtype(df[c]):
+            df[c] = df[c].astype("string").str.strip()
 
-# -----------------------------
-# Cleaning / coercions
-# -----------------------------
-def to_numeric_clean(s: pd.Series) -> pd.Series:
+    return df
+
+
+def to_numeric_clean_series(s: pd.Series) -> pd.Series:
     """
-    Convert strings like '$1,234.56', '45%', '1 234', '(123)' to floats.
-    Keeps NaN where conversion fails. Vectorized.
+    Clean a series into numeric:
+      - remove currency symbols & letters
+      - turn '(123.45)' into '-123.45'
+      - remove commas
+      - handle '%' as fraction (e.g., '35%' -> 0.35)
     """
-    if pd.api.types.is_numeric_dtype(s):
-        return pd.to_numeric(s, errors="coerce")
+    s_str = s.astype("string")
 
-    t = s.astype("string")
+    # mark if any % present (apply once for the whole series)
+    has_percent = s_str.str.contains("%", na=False).any()
 
-    has_percent = t.str.contains("%", regex=False, na=False)
+    def _clean_one(txt: pd._libs.missing.NAType | str) -> str:
+        if txt is pd.NA or txt is None:
+            return ""
+        txt = str(txt).strip()
+        if not txt:
+            return ""
+        # turn '(123)' into '-123'
+        txt = re.sub(r"^\(([^)]+)\)$", r"-\1", txt)
+        # drop currency/letters but keep digits, minus, dot, comma, percent, parentheses already handled
+        txt = _CURRENCY_CHARS.sub("", txt)
+        # remove commas
+        txt = txt.replace(",", "")
+        # strip spaces
+        txt = txt.replace(" ", "")
+        # remove any stray chars except digits, minus, dot
+        txt = re.sub(r"[^0-9\.\-]", "", txt)
+        return txt
 
-    # remove everything except digits, signs, decimal sep, percent and parentheses
-    t = t.str.replace(r"[^0-9\-\.,%()]", "", regex=True)
-
-    # parentheses negatives
-    neg = t.str.contains(r"\(", regex=True, na=False) & t.str.contains(r"\)", regex=True, na=False)
-    t = t.str.replace(r"[()]", "", regex=True)
-
-    both = t.str.contains(r"\.", regex=True, na=False) & t.str.contains(r",", regex=True, na=False)
-    t = t.mask(both, t.str.replace(",", "", regex=False))  # 1,234.56 -> 1234.56
-
-    comma_only = ~t.str.contains(r"\.", regex=True, na=False) & t.str.contains(r",", regex=True, na=False)
-    t = t.mask(comma_only, t.str.replace(",", ".", regex=False))  # 123,45 -> 123.45
-
-    t = t.str.replace("%", "", regex=False)
-
-    out = pd.to_numeric(t, errors="coerce")
-    out = out.where(~neg, -out)
-    out = out.where(~has_percent, out / 100.0)
+    cleaned = s_str.map(_clean_one)
+    out = pd.to_numeric(cleaned, errors="coerce")
+    if has_percent:
+        # if this column had any percentages, interpret values as percents
+        out = out / 100.0
     return out
 
 
 def coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Try to coerce non-numeric, non-datetime columns into numeric if most values are parseable.
+    """
     df = df.copy()
     for col in df.columns:
-        s = df[col]
-        s_num = to_numeric_clean(s)
-        if pd.api.types.is_numeric_dtype(s):
-            df[col] = pd.to_numeric(s, errors="coerce")
-        else:
-            valid_ratio = s_num.notna().mean()
-            if valid_ratio >= 0.6:
-                df[col] = s_num
+        if pd.api.types.is_numeric_dtype(df[col]) or pd.api.types.is_datetime64_any_dtype(df[col]):
+            continue
+
+        numeric = to_numeric_clean_series(df[col])
+        valid_ratio = numeric.notna().mean() if len(numeric) else 0.0
+        # convert if at least 60% became numbers
+        if valid_ratio >= 0.60:
+            df[col] = numeric
     return df
 
 
 def detect_date_columns(df: pd.DataFrame) -> List[str]:
-    candidates: List[str] = []
+    date_cols: List[str] = []
     for col in df.columns:
-        s = df[col]
-        if pd.api.types.is_datetime64_any_dtype(s):
-            candidates.append(col)
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            date_cols.append(col)
             continue
-        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
-            parsed = pd.to_datetime(s, errors="coerce", utc=False)
-            if parsed.notna().mean() >= 0.6:
-                candidates.append(col)
-    return candidates
+        if pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        s = df[col].astype("string")
+        parsed = pd.to_datetime(s, errors="coerce", utc=False)
+        ratio = parsed.notna().mean() if len(parsed) else 0.0
+        if ratio >= 0.60:
+            date_cols.append(col)
+    return date_cols
 
 
-def summarize_dates(df: pd.DataFrame, date_cols: List[str]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
+def coerce_date_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    df = df.copy()
+    for col in cols:
+        if not pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = pd.to_datetime(df[col], errors="coerce", utc=False)
+    return df
+
+
+def summarize_dates(df: pd.DataFrame, date_cols: List[str]) -> dict:
+    """
+    Return {col: {min, max, span_days, by_month, by_weekday}}
+    """
+    result: dict = {}
     weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
     for col in date_cols:
         dt = pd.to_datetime(df[col], errors="coerce", utc=False)
-        if dt.notna().sum() == 0:
+        dt = dt.dropna()
+        if dt.empty:
             continue
 
         dmin = dt.min()
         dmax = dt.max()
-        by_month = dt.dt.to_period("M").astype(str).value_counts().sort_index()
+        span = int((dmax - dmin).days)
+
+        by_month = (
+            dt.dt.to_period("M").astype(str).value_counts().sort_index().astype(int).to_dict()
+        )
         by_weekday = dt.dt.day_name().value_counts()
-        by_weekday = by_weekday.reindex(weekday_order).dropna().astype(int)
+        by_weekday = by_weekday.reindex(weekday_order, fill_value=0).astype(int).to_dict()
 
-        out[col] = {
-            "min": dmin.strftime("%Y-%m-%d"),
-            "max": dmax.strftime("%Y-%m-%d"),
-            "span_days": int((dmax.normalize() - dmin.normalize()).days),
-            "by_month": by_month.to_dict(),
-            "by_weekday": by_weekday.to_dict(),
+        result[col] = {
+            "min": dmin.date().isoformat(),
+            "max": dmax.date().isoformat(),
+            "span_days": span,
+            "by_month": by_month,
+            "by_weekday": by_weekday,
         }
-    return out
-
-# -----------------------------
-# Profiling
-# -----------------------------
-def round2(x):
-    if pd.isna(x):
-        return None
-    if isinstance(x, (int, float)):
-        return int(x) if float(x).is_integer() else round(float(x), 2)
-    return x
+    return result
 
 
-def numeric_summary(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
+def numeric_summary(df: pd.DataFrame) -> dict:
+    """
+    Describe numeric columns and round floats to 2 decimals.
+    """
+    out: dict = {}
     num_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    percentiles = [0.25, 0.50, 0.75]
     for col in num_cols:
-        s = pd.to_numeric(df[col], errors="coerce")
-        if s.notna().sum() == 0:
-            continue
-        q = s.quantile([0.25, 0.5, 0.75])
-        desc = {
-            "count": int(s.notna().sum()),
-            "mean": s.mean(),
-            "std": s.std(),
-            "min": s.min(),
-            "25%": q.get(0.25, None),
-            "50%": q.get(0.5, None),
-            "75%": q.get(0.75, None),
-            "max": s.max(),
+        desc = df[col].describe(percentiles=percentiles)
+        stats = {
+            "count": int(desc.get("count", 0)) if not pd.isna(desc.get("count", np.nan)) else 0,
+            "mean": float(desc.get("mean")) if not pd.isna(desc.get("mean", np.nan)) else None,
+            "std": float(desc.get("std")) if not pd.isna(desc.get("std", np.nan)) else None,
+            "min": float(desc.get("min")) if not pd.isna(desc.get("min", np.nan)) else None,
+            "25%": float(desc.get("25%")) if not pd.isna(desc.get("25%", np.nan)) else None,
+            "50%": float(desc.get("50%")) if not pd.isna(desc.get("50%", np.nan)) else None,
+            "75%": float(desc.get("75%")) if not pd.isna(desc.get("75%", np.nan)) else None,
+            "max": float(desc.get("max")) if not pd.isna(desc.get("max", np.nan)) else None,
         }
-        out[col] = {k: round2(v) for k, v in desc.items()}
+        # round floats
+        for k, v in stats.items():
+            if isinstance(v, float):
+                stats[k] = round(v, 2)
+        out[col] = stats
     return out
 
 
-def top5_categories(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
-    out: Dict[str, Dict[str, int]] = {}
+def top5_categories(df: pd.DataFrame, exclude_cols: List[str] | None = None) -> dict:
+    """
+    Top 5 categories for each non-numeric, non-datetime column, excluding any in exclude_cols.
+    """
+    exclude = set(exclude_cols or [])
+    out: dict = {}
     non_num_cols = df.select_dtypes(exclude=["number", "datetime"]).columns.tolist()
     for col in non_num_cols:
+        if col in exclude:
+            continue
         counts = df[col].astype("string").value_counts(dropna=True).head(5)
         if len(counts) > 0:
             out[col] = counts.to_dict()
     return out
 
 
-def profile_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
-    df = coerce_numeric_columns(df)
+def profile_dataframe(df: pd.DataFrame) -> dict:
+    # detect/parse dates first, then coerce numerics
     date_cols = detect_date_columns(df)
+    df = coerce_date_columns(df, date_cols)
+    df = coerce_numeric_columns(df)
 
-    result: Dict[str, Any] = {}
-    result["shape"] = {"rows": int(df.shape[0]), "columns": int(df.shape[1])}
-    result["columns"] = df.columns.astype(str).tolist()
-    result["nulls"] = {c: int(df[c].isna().sum()) for c in df.columns}
-    result["numeric_summary"] = numeric_summary(df)
-    result["date_summary"] = summarize_dates(df, date_cols)
-    result["top5_categories"] = top5_categories(df)
-    return result
+    # Build response
+    res: dict = {
+        "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "columns": [str(c) for c in df.columns],
+        "nulls": {str(c): int(df[c].isna().sum()) for c in df.columns},
+        "numeric_summary": numeric_summary(df),
+        "date_summary": summarize_dates(df, date_cols),
+        "top5_categories": top5_categories(df, exclude_cols=date_cols),
+    }
+    return res
+
 
 # -----------------------------
 # Routes
 # -----------------------------
 @app.get("/")
-def root() -> Dict[str, Any]:
-    return {"message": "Reverie Analytics API. Try /health or /analytics/*", "version": app.version}
+def root():
+    return {"message": "DAFE API. Try /health or /analytics/*"}
 
 @app.get("/health")
-def health() -> Dict[str, str]:
+def health():
     return {"status": "ok"}
 
 @app.post("/analytics/upload")
-async def upload(file: UploadFile = File(...)) -> Dict[str, str]:
+async def upload(file: UploadFile = File(...)):
+    if not file:
+        raise HTTPException(status_code=400, detail="No file provided.")
     try:
-        df = _read_dataframe_from_upload(file)
+        df = _read_upload_to_df(file)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+        raise HTTPException(status_code=400, detail=f"Could not parse file: {e}")
 
-    if df is None or df.shape[0] == 0:
-        raise HTTPException(status_code=400, detail="Uploaded file appears empty.")
+    dsid = str(uuid.uuid4())
+    DATASETS[dsid] = df
 
-    dataset_id = str(uuid.uuid4())
-    _DATASETS[dataset_id] = df
-    return {"dataset_id": dataset_id}
+    return {
+        "dataset_id": dsid,
+        "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "columns": [str(c) for c in df.columns],
+    }
 
 @app.get("/analytics/profile")
-def profile(dataset_id: str = Query(...)) -> Dict[str, Any]:
-    df = _DATASETS.get(dataset_id)
-    if df is None:
-        raise HTTPException(status_code=404, detail="dataset_id not found or expired")
-    try:
-        return profile_dataframe(df)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"profiling failed: {e}")
-
-# -----------------------------
-# Local dev
-# -----------------------------
-if __name__ == "__main__":
-    import uvicorn, os
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("guardrail_api:app", host="0.0.0.0", port=port, reload=True)
+def profile(dataset_id: str):
+    if dataset_id not in DATASETS:
+        raise HTTPException(status_code=404, detail="dataset_id not found")
+    df = DATASETS[dataset_id]
+    return profile_dataframe(df)
