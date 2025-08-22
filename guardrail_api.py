@@ -1,267 +1,272 @@
 # guardrail_api.py
-# FastAPI service for Reverie Co: upload a dataset, then profile it.
+# FastAPI service for quick file uploads + profiling
+# Endpoints:
+#   GET  /health
+#   POST /analytics/upload        (returns dataset_id)
+#   GET  /analytics/profile?dataset_id=...
 
-import io
-import os
-import uuid
-import csv
-from typing import Dict, Any, Optional, List
-
-import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from typing import Dict, Any
+from uuid import uuid4
+import pandas as pd
+import numpy as np
+import io, csv, re
 
-# -----------------------------
-# App & CORS
-# -----------------------------
-app = FastAPI(title="Reverie Analytics API", version="1.0.2")
+app = FastAPI(title="Reverie Analytics API", version="1.0.0")
 
-ALLOW_ORIGINS = [
+# -----------------------------------------------------------------------------
+# CORS – allow your production + preview domains
+# -----------------------------------------------------------------------------
+ALLOWED_ORIGINS = [
     "https://www.reveriesun.com",
     "https://reveriesun.com",
+    "https://reveriesun.netlify.app",
     "https://inspiring-tarsier-97b2c7.netlify.app",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5500",
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,      # set to ["*"] temporarily if you need to debug CORS
+    allow_origins=ALLOWED_ORIGINS,  # use ["*"] if you prefer
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Simple in-memory store
-# -----------------------------
-DATA_STORE: Dict[str, Dict[str, Any]] = {}
+# -----------------------------------------------------------------------------
+# Simple in-memory object store for uploaded files (dataset_id -> bytes, name)
+# -----------------------------------------------------------------------------
+_DATA_STORE: Dict[str, Dict[str, Any]] = {}
 
-# -----------------------------
-# CSV helpers
-# -----------------------------
-CANDIDATE_DELIMS: List[str] = [",", ";", "\t", "|"]
-
-def _repair_packed_csv(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """
-    Repair the common 'packed single column' (or single+empty column) CSV case:
-    - header looks like 'a,b,c,d' (contains a delimiter)
-    - df has 1 or 2 columns (second may be all empty 'Unnamed: 1')
-    Returns a fixed DataFrame or None if no repair applied.
-    """
-    if df is None or df.shape[1] > 2:
-        return None
-
-    hdr = str(df.columns[0]).strip().strip('"').strip("'")
-    delims_in_header = [d for d in CANDIDATE_DELIMS if d in hdr]
-    if not delims_in_header:
-        return None
-
-    # If there are 2 columns and the second is NOT all empty, don't guess.
-    if df.shape[1] == 2 and not df.iloc[:, 1].isna().all():
-        return None
-
-    # Choose delimiter with highest count in header
-    delim = max(delims_in_header, key=lambda d: hdr.count(d))
-    cols = [c.strip().strip('"').strip("'") for c in hdr.split(delim)]
-
-    s = df.iloc[:, 0].astype(str).str.rstrip(delim)
-    parts = s.str.split(delim, expand=True)
-
-    # Drop trailing empty column if present
-    if parts.shape[1] > 1 and parts.iloc[:, -1].replace("", pd.NA).isna().all():
-        parts = parts.iloc[:, :-1]
-
-    # Match header length to parts
-    if len(cols) < parts.shape[1]:
-        cols = cols + [f"col_{i}" for i in range(len(cols), parts.shape[1])]
-    elif len(cols) > parts.shape[1]:
-        cols = cols[:parts.shape[1]]
-
-    parts.columns = cols
-    return parts
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+_CURRENCY_CHARS = re.compile(r"[\$,]")
+_PERCENT_CHAR = re.compile(r"%")
+_WHITESPACE = re.compile(r"\s+")
 
 
-def read_csv_robust(raw_bytes: bytes) -> pd.DataFrame:
-    """
-    Try hard to parse a CSV regardless of delimiter/encoding quirks, including
-    the 'packed one column' case with a trailing delimiter.
-    """
-    df: Optional[pd.DataFrame] = None
-
-    # 1) Pandas autodetect
+def sniff_delimiter(sample: bytes) -> str:
+    """Try to guess delimiter for CSV-like files."""
     try:
-        df = pd.read_csv(
-            io.BytesIO(raw_bytes),
-            sep=None,
-            engine="python",
-            encoding="utf-8-sig",
-        )
+        text = sample.decode("utf-8", errors="ignore")
+        dialect = csv.Sniffer().sniff(text.splitlines()[0])
+        return dialect.delimiter
     except Exception:
-        df = None
+        # fallback to comma
+        return ","
 
-    # 2) Sniffer
-    if df is None or df.shape[1] == 1:
-        try:
-            sample = raw_bytes[:4096].decode("utf-8", "ignore")
-            dialect = csv.Sniffer().sniff(sample, delimiters="".join(CANDIDATE_DELIMS))
-            df2 = pd.read_csv(
-                io.BytesIO(raw_bytes),
-                sep=dialect.delimiter,
-                encoding="utf-8-sig",
-            )
-            if df2.shape[1] > 1:
-                df = df2
-        except Exception:
-            pass
 
-    # 3) Fallback: explicit candidates
-    if df is None or df.shape[1] == 1:
-        for sep in CANDIDATE_DELIMS:
-            try:
-                df2 = pd.read_csv(io.BytesIO(raw_bytes), sep=sep, encoding="utf-8-sig")
-                if df2.shape[1] > 1:
-                    df = df2
-                    break
-            except Exception:
-                continue
+def read_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Load CSV/TXT/XLS/XLSX into a DataFrame with best-effort parsing."""
+    name = filename.lower()
+    stream = io.BytesIO(file_bytes)
 
-    # 4) Repair the 'packed header + lines' case (1 column) or (1+empty column)
-    if df is not None:
-        fixed = _repair_packed_csv(df)
-        if fixed is not None and not fixed.empty:
-            df = fixed
+    if name.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(stream)
+        return df
 
-    if df is None:
-        raise ValueError("Could not parse CSV with any strategy.")
+    # CSV / TXT
+    # Try UTF-8 first; if it fails in a way that affects structure, fallback
+    text = file_bytes.decode("utf-8-sig", errors="ignore")
+    delim = sniff_delimiter(file_bytes)
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=delim)
+    except Exception:
+        df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+
+    # If we somehow got a single merged column but commas exist, re-read
+    if df.shape[1] == 1 and "," in text.splitlines()[0]:
+        df = pd.read_csv(io.StringIO(text), sep=",")
     return df
 
 
-def load_dataframe_from_bytes(filename: str, raw_bytes: bytes) -> pd.DataFrame:
-    name = (filename or "").lower()
-    if name.endswith((".xlsx", ".xls")):
-        try:
-            return pd.read_excel(io.BytesIO(raw_bytes), engine="openpyxl")
-        except Exception:
-            # fallback for legacy xls
-            return pd.read_excel(io.BytesIO(raw_bytes))
-    # Treat .txt like CSV
-    return read_csv_robust(raw_bytes)
-
-# ---------- NEW: make object columns numeric/datetime when possible ----------
-def coerce_types(df: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
-    """
-    For object columns:
-      1) Try numeric: strip '$', commas, and other symbols; to_numeric (coerce).
-         If >= threshold of non-null parses, keep as numeric.
-      2) Else try datetime: to_datetime (coerce). If >= threshold non-null, keep.
-    """
+def try_parse_dates(df: pd.DataFrame) -> pd.DataFrame:
+    """Attempt to convert obvious date-like text columns to datetime."""
     df = df.copy()
     for col in df.columns:
-        if pd.api.types.is_object_dtype(df[col]):
-            s = df[col].astype(str)
+        s = df[col]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            continue
+        if not pd.api.types.is_object_dtype(s) and not pd.api.types.is_string_dtype(s):
+            continue
 
-            # try numeric
-            s_clean = s.str.replace(r"[^\d\.\-]", "", regex=True).replace("", pd.NA)
-            num = pd.to_numeric(s_clean, errors="coerce")
-            if num.notna().mean() >= threshold:
-                df[col] = num
-                continue
-
-            # try datetime
-            dt = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
-            if dt.notna().mean() >= threshold:
-                df[col] = dt
-
+        # Try parse; consider it a date if many non-nulls parse successfully
+        parsed = pd.to_datetime(s, errors="coerce", infer_datetime_format=True, utc=False)
+        non_null = s.notna().sum()
+        parsed_ok = parsed.notna().sum()
+        if non_null > 0 and parsed_ok / max(1, non_null) >= 0.7:
+            df[col] = parsed.dt.tz_localize(None)  # drop tz if present
     return df
-# ---------------------------------------------------------------------------
 
 
-def numeric_summary(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    num = df.select_dtypes(include="number")
-    if num.empty:
-        return {}
-    desc = num.describe(percentiles=[0.25, 0.5, 0.75]).to_dict()
-    wanted = {"count", "mean", "std", "min", "25%", "50%", "75%", "max"}
-    out: Dict[str, Dict[str, float]] = {}
+def to_numeric_clean(series: pd.Series) -> pd.Series:
+    """
+    Convert strings with currency symbols, commas, percent signs to numeric.
+    Keeps original if too few values convert.
+    """
+    if pd.api.types.is_numeric_dtype(series):
+        return series
 
-    if wanted <= set(desc.keys()):
-        # {stat: {col: val}}
-        for stat, col_map in desc.items():
-            for col, val in col_map.items():
-                out.setdefault(str(col), {})[stat] = None if pd.isna(val) else float(val)
-    else:
-        # {col: {stat: val}}
-        for col, stat_map in desc.items():
-            out[str(col)] = {k: None if pd.isna(v) else float(v) for k, v in stat_map.items()}
-    return out
+    if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+        return series
+
+    txt = series.astype(str)
+    txt = _CURRENCY_CHARS.sub("", txt)          # $ 1,234.56 -> 1234.56
+    txt = _WHITESPACE.sub("", txt)              # remove stray spaces
+    pct_mask = txt.str.contains("%", na=False)
+    txt = _PERCENT_CHAR.sub("", txt)
+    num = pd.to_numeric(txt, errors="coerce")
+
+    # If we cleaned % values, interpret 12.3% as 0.123 *unless* most look like whole dollars
+    if pct_mask.any():
+        num.loc[pct_mask] = num.loc[pct_mask] / 100.0
+
+    # adopt conversion if at least 60% of non-null strings converted
+    orig_non_null = series.notna().sum()
+    converted = num.notna().sum()
+    if orig_non_null > 0 and converted / orig_non_null >= 0.6:
+        return num
+    return series
 
 
-def top5_categories(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
-    out: Dict[str, Dict[str, int]] = {}
-    obj = df.select_dtypes(include=["object", "string"])
-    for col in obj.columns:
-        vc = obj[col].astype(str).value_counts(dropna=False).head(5)
-        out[str(col)] = {str(k): int(v) for k, v in vc.items()}
-    return out
+def coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply numeric coercion (with currency/percent support) to object columns."""
+    df = df.copy()
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            continue
+        df[col] = to_numeric_clean(df[col])
+    return df
 
 
-def null_counts(df: pd.DataFrame) -> Dict[str, int]:
-    return {str(c): int(n) for c, n in df.isna().sum().to_dict().items()}
+def round_floats(obj, ndigits: int = 2):
+    """Recursively round floats in dict/list structures."""
+    if isinstance(obj, dict):
+        return {k: round_floats(v, ndigits) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [round_floats(v, ndigits) for v in obj]
+    if isinstance(obj, float) and np.isfinite(obj):
+        return round(obj, ndigits)
+    if isinstance(obj, (np.floating,)):
+        try:
+            return round(float(obj), ndigits)
+        except Exception:
+            return float(obj)
+    return obj
 
-# -----------------------------
+
+def profile_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
+    """Build the profiling summary JSON."""
+    # Basic info
+    shape = {"rows": int(df.shape[0]), "columns": int(df.shape[1])}
+    columns = [str(c) for c in df.columns]
+
+    # Null counts
+    nulls = {str(c): int(df[c].isna().sum()) for c in df.columns}
+
+    # Numeric summary (rounded)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    numeric_summary: Dict[str, Dict[str, Any]] = {}
+    for c in numeric_cols:
+        s = df[c].dropna()
+        if s.empty:
+            continue
+        q25, q50, q75 = s.quantile([0.25, 0.5, 0.75]).tolist()
+        numeric_summary[str(c)] = {
+            "count": int(s.count()),
+            "mean": float(s.mean()),
+            "std": float(s.std(ddof=1)) if s.count() > 1 else 0.0,
+            "min": float(s.min()),
+            "25%": float(q25),
+            "50%": float(q50),
+            "75%": float(q75),
+            "max": float(s.max()),
+        }
+
+    # Top categories (strings / non-numeric, non-datetime)
+    cat_cols = [
+        c for c in df.columns
+        if not pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_datetime64_any_dtype(df[c])
+    ]
+    top5_categories: Dict[str, Dict[str, int]] = {}
+    for c in cat_cols:
+        vc = df[c].dropna().astype(str).value_counts().head(5)
+        if not vc.empty:
+            top5_categories[str(c)] = {str(k): int(v) for k, v in vc.items()}
+
+    # dtypes
+    dtypes = {str(c): str(dt) for c, dt in df.dtypes.items()}
+
+    # date range summary
+    date_summary: Dict[str, Dict[str, str]] = {}
+    for c in df.select_dtypes(include="datetime64[ns]").columns:
+        s = df[c].dropna()
+        if not s.empty:
+            date_summary[str(c)] = {
+                "min": s.min().isoformat(),
+                "max": s.max().isoformat(),
+            }
+
+    out = {
+        "shape": shape,
+        "columns": columns,
+        "nulls": nulls,
+        "numeric_summary": numeric_summary,
+        "top5_categories": top5_categories,
+        "dtypes": dtypes,
+        "date_summary": date_summary,
+    }
+    return round_floats(out, 2)
+
+# -----------------------------------------------------------------------------
 # Routes
-# -----------------------------
-@app.get("/")
-def root():
-    return {"message": "Reverie Analytics API. Try /health or /analytics/*"}
-
+# -----------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-@app.post("/analytics/upload")
-async def upload_dataset(file: UploadFile = File(...)):
-    if not file:
-        raise HTTPException(status_code=400, detail="No file provided.")
-    filename = file.filename or ""
-    ext = (filename.split(".")[-1] or "").lower()
-    if ext not in {"csv", "xlsx", "xls", "txt"}:
-        raise HTTPException(status_code=415, detail="Unsupported file type.")
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty file.")
+@app.get("/")
+def root():
+    return JSONResponse(
+        {"message": "Reverie Analytics API. Try /health or /analytics/*"},
+        status_code=200,
+    )
 
-    dataset_id = str(uuid.uuid4())
-    DATA_STORE[dataset_id] = {"bytes": content, "filename": filename}
-    return {"dataset_id": dataset_id}
+@app.post("/analytics/upload")
+async def upload(file: UploadFile = File(...)):
+    """Upload a CSV/XLSX file and receive a dataset_id for profiling."""
+    name = (file.filename or "upload").strip()
+    ext = (name.split(".")[-1] or "").lower()
+
+    if ext not in ("csv", "txt", "xlsx", "xls"):
+        raise HTTPException(status_code=415, detail="Unsupported file type")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty upload")
+
+    dsid = str(uuid4())
+    _DATA_STORE[dsid] = {"name": name, "bytes": data}
+    return {"dataset_id": dsid, "filename": name, "size": len(data)}
 
 @app.get("/analytics/profile")
-def profile_dataset(dataset_id: str = Query(..., alias="dataset_id")):
-    item = DATA_STORE.get(dataset_id)
+def profile(dataset_id: str):
+    """Return profiling summary for a previously uploaded dataset."""
+    item = _DATA_STORE.get(dataset_id)
     if not item:
-        raise HTTPException(status_code=404, detail="dataset_id not found")
-    try:
-        df = load_dataframe_from_bytes(item["filename"], item["bytes"])
-        df = coerce_types(df)   # <-- ensure amount is numeric, dates are datetime
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read dataset: {e}")
+        raise HTTPException(status_code=404, detail="Unknown dataset_id")
 
-    try:
-        shape = {"rows": int(df.shape[0]), "columns": int(df.shape[1])}
-        cols = [str(c) for c in df.columns]
-        nulls = null_counts(df)
-        nums = numeric_summary(df)
-        cats = top5_categories(df)
+    # Load DataFrame
+    df = read_table(item["bytes"], item["name"])
 
-        return {
-            "shape": shape,
-            "columns": cols,
-            "nulls": nulls,
-            "numeric_summary": nums,
-            "top5_categories": cats,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Profiling failed: {e}")
+    # Best-effort cleanups
+    df.columns = [str(c).strip() for c in df.columns]
+    df = try_parse_dates(df)
+    df = coerce_numeric_columns(df)
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", "8000"))
-    uvicorn.run("guardrail_api:app", host="0.0.0.0", port=port, reload=True)
+    # Build and return summary
+    return profile_dataframe(df)
