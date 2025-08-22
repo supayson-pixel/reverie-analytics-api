@@ -1,292 +1,270 @@
-from __future__ import annotations
-
-import io
-import re
-import uuid
-from typing import Dict, List
-
-import numpy as np
-import pandas as pd
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-
-# -----------------------------
-# FastAPI app + CORS
-# -----------------------------
-app = FastAPI(title="DAFE API")
-
-# For the demo, keep CORS permissive to avoid surprises between Netlify & Render.
-# If you want to lock down later, replace ["*"] with your exact origins.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# -----------------------------
-# In-memory dataset store
-# -----------------------------
-DATASETS: Dict[str, pd.DataFrame] = {}
-
-# -----------------------------
-# Helpers (read/clean/coerce)
-# -----------------------------
-
-# Currency symbols & spaces; keep digits, minus, and decimal.
-_CURRENCY_CHARS = re.compile(r"[^\d\-\.\%\,\(\)\s]")
-
-def _sniff_delimiter(text: str) -> str:
-    # Gentle heuristic; prefer comma, then tab, then semicolon/pipe
-    candidates = [",", "\t", ";", "|"]
-    counts = {c: text.count(c) for c in candidates}
-    delim = max(counts, key=counts.get)
-    # if no delimiter found, default to comma
-    return delim if counts[delim] > 0 else ","
-
-def _read_upload_to_df(file: UploadFile) -> pd.DataFrame:
-    name = (file.filename or "").lower()
-
-    if name.endswith((".xlsx", ".xls")):
-        # Excel path
-        df = pd.read_excel(file.file)
-    else:
-        # CSV/TXT path
-        raw = file.file.read()
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            # Fallback commonly helps with Windows-1252 exports
-            text = raw.decode("latin-1")
-
-        delim = _sniff_delimiter(text)
-        df = pd.read_csv(io.StringIO(text), sep=delim, engine="python")
-
-    # Normalize column names: strip whitespace & wrapping quotes; drop fully-empty cols
-    df.columns = (
-        pd.Series(df.columns)
-        .astype("string")
-        .str.strip()
-        .str.replace(r'^["\']|["\']$', "", regex=True)
-        .str.replace(r"^Unnamed:.*", "", regex=True)
-    )
-    df = df.loc[:, df.columns.ne("")]            # remove columns that became empty after cleaning
-    df = df.dropna(axis=1, how="all")            # drop all-NaN columns
-    # trim whitespace for string-like columns
-    for c in df.columns:
-        if pd.api.types.is_object_dtype(df[c]) or pd.api.types.is_string_dtype(df[c]):
-            df[c] = df[c].astype("string").str.strip()
-
-    return df
-
-
-def to_numeric_clean_series(s: pd.Series) -> pd.Series:
-    """
-    Clean a series into numeric:
-      - remove currency symbols & letters
-      - turn '(123.45)' into '-123.45'
-      - remove commas
-      - handle '%' as fraction (e.g., '35%' -> 0.35)
-    """
-    s_str = s.astype("string")
-
-    # mark if any % present (apply once for the whole series)
-    has_percent = s_str.str.contains("%", na=False).any()
-
-    def _clean_one(txt: pd._libs.missing.NAType | str) -> str:
-        if txt is pd.NA or txt is None:
-            return ""
-        txt = str(txt).strip()
-        if not txt:
-            return ""
-        # turn '(123)' into '-123'
-        txt = re.sub(r"^\(([^)]+)\)$", r"-\1", txt)
-        # drop currency/letters but keep digits, minus, dot, comma, percent, parentheses already handled
-        txt = _CURRENCY_CHARS.sub("", txt)
-        # remove commas
-        txt = txt.replace(",", "")
-        # strip spaces
-        txt = txt.replace(" ", "")
-        # remove any stray chars except digits, minus, dot
-        txt = re.sub(r"[^0-9\.\-]", "", txt)
-        return txt
-
-    cleaned = s_str.map(_clean_one)
-    out = pd.to_numeric(cleaned, errors="coerce")
-    if has_percent:
-        # if this column had any percentages, interpret values as percents
-        out = out / 100.0
-    return out
-
-
-def coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Try to coerce non-numeric, non-datetime columns into numeric if most values are parseable.
-    """
-    df = df.copy()
-    for col in df.columns:
-        if pd.api.types.is_numeric_dtype(df[col]) or pd.api.types.is_datetime64_any_dtype(df[col]):
-            continue
-
-        numeric = to_numeric_clean_series(df[col])
-        valid_ratio = numeric.notna().mean() if len(numeric) else 0.0
-        # convert if at least 60% became numbers
-        if valid_ratio >= 0.60:
-            df[col] = numeric
-    return df
-
-
-def detect_date_columns(df: pd.DataFrame) -> List[str]:
-    date_cols: List[str] = []
-    for col in df.columns:
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
-            date_cols.append(col)
-            continue
-        if pd.api.types.is_numeric_dtype(df[col]):
-            continue
-        s = df[col].astype("string")
-        parsed = pd.to_datetime(s, errors="coerce", utc=False)
-        ratio = parsed.notna().mean() if len(parsed) else 0.0
-        if ratio >= 0.60:
-            date_cols.append(col)
-    return date_cols
-
-
-def coerce_date_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    df = df.copy()
-    for col in cols:
-        if not pd.api.types.is_datetime64_any_dtype(df[col]):
-            df[col] = pd.to_datetime(df[col], errors="coerce", utc=False)
-    return df
-
-
-def summarize_dates(df: pd.DataFrame, date_cols: List[str]) -> dict:
-    """
-    Return {col: {min, max, span_days, by_month, by_weekday}}
-    """
-    result: dict = {}
-    weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-
-    for col in date_cols:
-        dt = pd.to_datetime(df[col], errors="coerce", utc=False)
-        dt = dt.dropna()
-        if dt.empty:
-            continue
-
-        dmin = dt.min()
-        dmax = dt.max()
-        span = int((dmax - dmin).days)
-
-        by_month = (
-            dt.dt.to_period("M").astype(str).value_counts().sort_index().astype(int).to_dict()
-        )
-        by_weekday = dt.dt.day_name().value_counts()
-        by_weekday = by_weekday.reindex(weekday_order, fill_value=0).astype(int).to_dict()
-
-        result[col] = {
-            "min": dmin.date().isoformat(),
-            "max": dmax.date().isoformat(),
-            "span_days": span,
-            "by_month": by_month,
-            "by_weekday": by_weekday,
-        }
-    return result
-
-
-def numeric_summary(df: pd.DataFrame) -> dict:
-    """
-    Describe numeric columns and round floats to 2 decimals.
-    """
-    out: dict = {}
-    num_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    percentiles = [0.25, 0.50, 0.75]
-    for col in num_cols:
-        desc = df[col].describe(percentiles=percentiles)
-        stats = {
-            "count": int(desc.get("count", 0)) if not pd.isna(desc.get("count", np.nan)) else 0,
-            "mean": float(desc.get("mean")) if not pd.isna(desc.get("mean", np.nan)) else None,
-            "std": float(desc.get("std")) if not pd.isna(desc.get("std", np.nan)) else None,
-            "min": float(desc.get("min")) if not pd.isna(desc.get("min", np.nan)) else None,
-            "25%": float(desc.get("25%")) if not pd.isna(desc.get("25%", np.nan)) else None,
-            "50%": float(desc.get("50%")) if not pd.isna(desc.get("50%", np.nan)) else None,
-            "75%": float(desc.get("75%")) if not pd.isna(desc.get("75%", np.nan)) else None,
-            "max": float(desc.get("max")) if not pd.isna(desc.get("max", np.nan)) else None,
-        }
-        # round floats
-        for k, v in stats.items():
-            if isinstance(v, float):
-                stats[k] = round(v, 2)
-        out[col] = stats
-    return out
-
-
-def top5_categories(df: pd.DataFrame, exclude_cols: List[str] | None = None) -> dict:
-    """
-    Top 5 categories for each non-numeric, non-datetime column, excluding any in exclude_cols.
-    """
-    exclude = set(exclude_cols or [])
-    out: dict = {}
-    non_num_cols = df.select_dtypes(exclude=["number", "datetime"]).columns.tolist()
-    for col in non_num_cols:
-        if col in exclude:
-            continue
-        counts = df[col].astype("string").value_counts(dropna=True).head(5)
-        if len(counts) > 0:
-            out[col] = counts.to_dict()
-    return out
-
-
-def profile_dataframe(df: pd.DataFrame) -> dict:
-    # detect/parse dates first, then coerce numerics
-    date_cols = detect_date_columns(df)
-    df = coerce_date_columns(df, date_cols)
-    df = coerce_numeric_columns(df)
-
-    # Build response
-    res: dict = {
-        "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
-        "columns": [str(c) for c in df.columns],
-        "nulls": {str(c): int(df[c].isna().sum()) for c in df.columns},
-        "numeric_summary": numeric_summary(df),
-        "date_summary": summarize_dates(df, date_cols),
-        "top5_categories": top5_categories(df, exclude_cols=date_cols),
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Reverie Co — Lab</title>
+  <style>
+    :root {
+      --bg:#0b1220; --panel:#101a2c; --ink:#eaf1ff; --dim:#9fb1d0;
+      --brand1:#6fe1ff; --brand2:#6d7bff; --good:#19d39d; --bad:#ff6b6b;
+      --border:#20304b; --accent:#192540;
     }
-    return res
+    * { box-sizing: border-box; }
+    html, body { margin:0; padding:0; background:var(--bg); color:var(--ink);
+      font:16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; }
+    a { color: var(--brand1); text-decoration: none; }
+    .wrap { max-width: 1100px; margin: 42px auto; padding: 0 20px; }
+    h1 { margin: 0 0 12px; font-size: 36px; }
+    .crumb { margin-bottom: 20px; }
+    .panel { background:linear-gradient(180deg, #121d34, #0e1727); border:1px solid var(--border); border-radius:16px; padding:20px; }
+    .controls { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    input[type=file] { padding: 10px; background: var(--panel); border:1px solid var(--border); color:var(--ink); border-radius:10px; }
+    button {
+      border:0; color:#081225; font-weight:700; padding:12px 18px; border-radius:12px; cursor:pointer;
+      background:linear-gradient(90deg, var(--brand1), var(--brand2));
+    }
+    button.secondary { background:#1b2a46; color:var(--ink); border:1px solid var(--border); }
+    .hint { color:var(--dim); font-size:14px; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:12px; margin-top:12px; }
+    pre { white-space:pre-wrap; word-break:break-word; background: #0d1628; border:1px solid var(--border); padding:16px; border-radius:12px; }
+    .badge { display:inline-block; padding:2px 8px; background:#14203a; border:1px solid var(--border); border-radius:100px; color:var(--dim); font-size:12px; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { padding:10px 8px; border-bottom:1px solid var(--border); text-align:left; }
+    .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .muted { color:var(--dim); }
+    .good { color:var(--good); }
+    .bad { color:var(--bad); }
+    .section { margin-top:22px; }
+    .sticky { position: sticky; top: 0; background: var(--bg); padding:8px 0 16px; z-index: 2; }
+    .right { margin-left:auto; }
+    code.copy { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; background:#0e1a2d; padding:4px 8px; border-radius:8px; border:1px solid var(--border); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="crumb"><a href="/">&larr; Back to site</a></div>
+    <div class="sticky"><h1>Reverie Co — Lab</h1></div>
 
+    <div class="panel">
+      <div class="row" style="margin-bottom:10px">
+        <div class="badge">API</div>
+        <code class="copy" id="apiBase"></code>
+        <span class="muted">Upload a CSV/XLSX to get a <code>dataset_id</code>, then profile it.</span>
+      </div>
 
-# -----------------------------
-# Routes
-# -----------------------------
-@app.get("/")
-def root():
-    return {"message": "DAFE API. Try /health or /analytics/*"}
+      <div class="controls">
+        <input id="file" type="file" accept=".csv,.xlsx,.xls,.txt" />
+        <button id="go">Upload &amp; Profile</button>
+        <button class="secondary" id="copyJson" title="Copy JSON" disabled>Copy JSON</button>
+        <button class="secondary" id="toggle" title="Show/Hide raw JSON" disabled>Toggle JSON</button>
+        <span class="hint" id="status">Waiting for upload…</span>
+      </div>
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+      <div class="section">
+        <div class="grid">
+          <div class="panel">
+            <div class="muted">dataset_id</div>
+            <div id="dsid" style="word-break: break-all">—</div>
+          </div>
+          <div class="panel">
+            <div class="muted">Shape</div>
+            <div id="shape">—</div>
+          </div>
+          <div class="panel">
+            <div class="muted">Columns</div>
+            <div id="columns">—</div>
+          </div>
+        </div>
+      </div>
 
-@app.post("/analytics/upload")
-async def upload(file: UploadFile = File(...)):
-    if not file:
-        raise HTTPException(status_code=400, detail="No file provided.")
-    try:
-        df = _read_upload_to_df(file)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not parse file: {e}")
+      <div class="section grid">
+        <div class="panel">
+          <div class="row"><strong>Nulls by column</strong></div>
+          <div id="nulls">—</div>
+        </div>
+        <div class="panel">
+          <div class="row"><strong>Top 5 categories</strong></div>
+          <div class="muted" style="margin:-6px 0 8px">Date-like columns are excluded.</div>
+          <div id="cats">—</div>
+        </div>
+      </div>
 
-    dsid = str(uuid.uuid4())
-    DATASETS[dsid] = df
+      <div class="section grid">
+        <div class="panel">
+          <div class="row"><strong>Numeric summary</strong></div>
+          <div id="nums">—</div>
+        </div>
+        <div class="panel">
+          <div class="row"><strong>Date summary</strong></div>
+          <div class="muted" style="margin:-6px 0 8px">Min/Max/Span + by month & by weekday.</div>
+          <div id="dates">—</div>
+        </div>
+      </div>
 
-    return {
-        "dataset_id": dsid,
-        "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
-        "columns": [str(c) for c in df.columns],
+      <div class="section panel">
+        <div class="row">
+          <strong>Raw JSON</strong>
+        </div>
+        <pre id="jsonBox" hidden>{"status":"waiting"}</pre>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // === Configure your live API here ===
+    const API_URL = "https://reverie-analytics-api.onrender.com";
+    // ====================================
+
+    document.getElementById('apiBase').textContent = API_URL;
+
+    const $ = sel => document.querySelector(sel);
+    const statusEl = $('#status');
+    const fileEl = $('#file');
+    const goBtn = $('#go');
+    const copyBtn = $('#copyJson');
+    const toggleBtn = $('#toggle');
+    const jsonBox = $('#jsonBox');
+
+    let lastProfile = null;
+
+    toggleBtn.addEventListener('click', () => {
+      jsonBox.hidden = !jsonBox.hidden;
+    });
+
+    copyBtn.addEventListener('click', () => {
+      if (!lastProfile) return;
+      navigator.clipboard.writeText(JSON.stringify(lastProfile, null, 2));
+      status('Copied JSON to clipboard ✔', 'good');
+    });
+
+    goBtn.addEventListener('click', async () => {
+      try {
+        const f = fileEl.files?.[0];
+        if (!f) return status('Please choose a file first.', 'bad');
+        if (f.size > 25 * 1024 * 1024) return status('File too large (limit ~25 MB for demo).', 'bad');
+
+        status('Uploading… (cold starts can take a few seconds)');
+        goBtn.disabled = true;
+
+        const form = new FormData();
+        form.append('file', f);
+        const up = await fetch(`${API_URL}/analytics/upload`, { method:'POST', body: form });
+        if (!up.ok) throw new Error(await up.text());
+        const meta = await up.json();
+        $('#dsid').textContent = meta.dataset_id || '—';
+
+        status('Profiling…');
+        const prof = await fetch(`${API_URL}/analytics/profile?dataset_id=${encodeURIComponent(meta.dataset_id)}`);
+        if (!prof.ok) throw new Error(await prof.text());
+        const data = await prof.json();
+        lastProfile = data;
+        copyBtn.disabled = false;
+        toggleBtn.disabled = false;
+
+        // Fill summary boxes
+        $('#shape').textContent = data?.shape ? `${data.shape.rows} rows × ${data.shape.columns} cols` : '—';
+        $('#columns').textContent = data?.columns?.length ? data.columns.join(', ') : '—';
+
+        // Nulls
+        $('#nulls').innerHTML = renderKVTable(data?.nulls || {}, 'Column', 'Nulls');
+
+        // Top categories (already excludes dates on the API)
+        $('#cats').innerHTML = Object.keys(data?.top5_categories || {}).length
+          ? Object.entries(data.top5_categories).map(([col, kv]) => `
+              <div style="margin:8px 0"><div class="muted">${escapeHtml(col)}</div>
+                ${renderKVTable(kv, 'Value', 'Count')}
+              </div>`).join('')
+          : '—';
+
+        // Numeric summary
+        $('#nums').innerHTML = renderNumericSummary(data?.numeric_summary || {});
+
+        // Date summary
+        $('#dates').innerHTML = renderDateSummary(data?.date_summary || {});
+
+        // Raw JSON
+        jsonBox.textContent = JSON.stringify(data, null, 2);
+        jsonBox.hidden = false;
+
+        status('Done ✔', 'good');
+      } catch (err) {
+        console.error(err);
+        status('Error: ' + (err?.message || err), 'bad');
+      } finally {
+        goBtn.disabled = false;
+      }
+    });
+
+    function renderKVTable(obj, kLabel, vLabel) {
+      const rows = Object.entries(obj);
+      if (!rows.length) return '—';
+      return `<table>
+        <thead><tr><th>${kLabel}</th><th>${vLabel}</th></tr></thead>
+        <tbody>${rows.map(([k,v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(String(v))}</td></tr>`).join('')}</tbody>
+      </table>`;
     }
 
-@app.get("/analytics/profile")
-def profile(dataset_id: str):
-    if dataset_id not in DATASETS:
-        raise HTTPException(status_code=404, detail="dataset_id not found")
-    df = DATASETS[dataset_id]
-    return profile_dataframe(df)
+    function renderNumericSummary(numSummary) {
+      const cols = Object.keys(numSummary || {});
+      if (!cols.length) return '—';
+      const wanted = ['count','mean','std','min','25%','50%','75%','max'];
+      return cols.map(c => {
+        const s = numSummary[c] || {};
+        return `<div style="margin:8px 0">
+          <div class="muted">${escapeHtml(c)}</div>
+          <table>
+            <thead><tr>${wanted.map(w => `<th>${w}</th>`).join('')}</tr></thead>
+            <tbody>
+              <tr>${wanted.map(w => `<td>${fmt(s[w])}</td>`).join('')}</tr>
+            </tbody>
+          </table>
+        </div>`;
+      }).join('');
+    }
+
+    function renderDateSummary(ds) {
+      const cols = Object.keys(ds || {});
+      if (!cols.length) return '—';
+      return cols.map(col => {
+        const d = ds[col] || {};
+        const meta = [
+          ['Min', d.min ?? '—'],
+          ['Max', d.max ?? '—'],
+          ['Span (days)', d.span_days ?? '—'],
+        ];
+        return `<div style="margin:8px 0">
+          <div class="muted">${escapeHtml(col)}</div>
+          <div class="grid">
+            <div class="panel">
+              <div class="muted">Range</div>
+              ${renderList(meta)}
+            </div>
+            <div class="panel">
+              <div class="muted">By month</div>
+              ${renderKVTable(d.by_month || {}, 'Month', 'Count')}
+            </div>
+            <div class="panel">
+              <div class="muted">By weekday</div>
+              ${renderKVTable(d.by_weekday || {}, 'Weekday', 'Count')}
+            </div>
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    function renderList(pairs){
+      return `<table>
+        <tbody>${pairs.map(([k,v]) => `<tr><td class="muted" style="width:140px">${k}</td><td>${escapeHtml(String(v))}</td></tr>`).join('')}</tbody>
+      </table>`;
+    }
+
+    function fmt(x){
+      return (x === null || x === undefined || Number.isNaN(x)) ? '—'
+        : (typeof x === 'number' ? Number(x.toFixed(2)) : escapeHtml(String(x)));
+    }
+    function status(msg, mood){ statusEl.textContent = msg; statusEl.className = 'hint ' + (mood || ''); }
+    function escapeHtml(s){ return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+  </script>
+</body>
+</html>
