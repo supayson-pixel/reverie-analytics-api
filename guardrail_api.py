@@ -1,188 +1,107 @@
-from __future__ import annotations
-
-import os
-import io
+# guardrail_api.py
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import pandas as pd
 import uuid
-import pathlib
+import os
 from typing import Dict, Any
 
-import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+app = FastAPI(title="DAFE API")
 
-# --------- Config ---------
-# Where to store uploads (Render allows writing to /tmp)
-UPLOAD_DIR = pathlib.Path(os.getenv("UPLOAD_DIR", "/tmp/uploads"))
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-# Allowed extensions (front-end accepts .csv, .xlsx, .xls)
-ALLOWED_EXTS = {".csv", ".xlsx", ".xls"}
-
-# Try to support Excel; if openpyxl isn't installed, we’ll reject Excel files gracefully.
-try:
-    import openpyxl  # noqa: F401
-    HAS_XLSX = True
-except Exception:
-    HAS_XLSX = False
-
-# --------- App ---------
-app = FastAPI(
-    title="Reverie Analytics API",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
-)
-
-# CORS: include BOTH www and apex, plus your preview domain.
+# ---- CORS: allow your live domains + preview subdomain ----
 ALLOWED_ORIGINS = [
     "https://www.reveriesun.com",
     "https://reveriesun.com",
-    "https://inspiring-tarsier-97b2c7.netlify.app",  # preview
-    # Local dev (optional):
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://localhost:5500",
+    # Netlify preview / production subdomain(s). Add others as needed.
+    "https://inspiring-tarsier-97b2c7.netlify.app",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=ALLOWED_ORIGINS,   # or ["*"] during dev
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    max_age=86400,
 )
 
+# ---- simple in-memory registry for uploaded files (OK for demo) ----
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+REGISTRY: Dict[str, str] = {}  # dataset_id -> file_path
 
-# --------- Helpers ---------
-def _dataset_path(dataset_id: str) -> pathlib.Path:
-    return UPLOAD_DIR / f"{dataset_id}.bin"
+# ---------- health ----------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
-def _save_upload(file: UploadFile) -> str:
-    ext = pathlib.Path(file.filename).suffix.lower()
-    if ext not in ALLOWED_EXTS:
-        raise HTTPException(status_code=415, detail=f"Unsupported file type {ext}. Use CSV/XLSX.")
+# ---------- upload ----------
+@app.post("/analytics/upload")
+async def upload_dataset(file: UploadFile = File(...)) -> Dict[str, Any]:
+    # Accept csv/xlsx/xls only (remove txt unless you want to parse it)
+    name = file.filename or ""
+    ext = name.split(".")[-1].lower()
+    if ext not in ("csv", "xlsx", "xls"):
+        raise HTTPException(status_code=400, detail="Please upload a CSV or Excel file.")
 
-    if ext in {".xlsx", ".xls"} and not HAS_XLSX:
-        raise HTTPException(
-            status_code=415,
-            detail="Excel files require 'openpyxl' on the server. Install it or upload CSV."
-        )
+    dataset_id = str(uuid.uuid4())
+    dest_path = os.path.join(UPLOAD_DIR, f"{dataset_id}.{ext}")
 
-    data = file.file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file.")
+    with open(dest_path, "wb") as out:
+        out.write(await file.read())
 
-    dataset_id = uuid.uuid4().hex
-    # Store a tiny header with extension so we know how to read later.
-    # Format: b"EXT:<ext>\n" + payload
-    header = f"EXT:{ext}\n".encode("utf-8")
-    _dataset_path(dataset_id).write_bytes(header + data)
-    return dataset_id
+    REGISTRY[dataset_id] = dest_path
+    return {"dataset_id": dataset_id, "filename": name}
 
-def _load_dataframe(dataset_id: str) -> pd.DataFrame:
-    path = _dataset_path(dataset_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="dataset_id not found")
+# ---------- profile ----------
+@app.get("/analytics/profile")
+def analytics_profile(dataset_id: str) -> Dict[str, Any]:
+    path = REGISTRY.get(dataset_id)
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="dataset_id not found (or expired).")
 
-    blob = path.read_bytes()
+    ext = path.split(".")[-1].lower()
     try:
-        header, payload = blob.split(b"\n", 1)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Corrupt dataset file")
+        if ext == "csv":
+            df = pd.read_csv(path)
+        else:
+            # xlsx / xls
+            df = pd.read_excel(path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
 
-    header_text = header.decode("utf-8", errors="ignore")
-    if not header_text.startswith("EXT:"):
-        raise HTTPException(status_code=400, detail="Missing file header")
-    ext = header_text[4:].strip().lower()
-
-    bio = io.BytesIO(payload)
-    if ext == ".csv":
-        df = pd.read_csv(bio)
-    elif ext in {".xlsx", ".xls"}:
-        if not HAS_XLSX:
-            raise HTTPException(
-                status_code=415,
-                detail="Excel files require 'openpyxl' on the server. Install it or upload CSV."
-            )
-        df = pd.read_excel(bio)  # uses openpyxl when available
-    else:
-        raise HTTPException(status_code=415, detail=f"Unsupported extension {ext}")
-
-    return df
-
-
-def _profile_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
-    # Shape & columns
+    # summary
     shape = {"rows": int(df.shape[0]), "columns": int(df.shape[1])}
     columns = list(map(str, df.columns))
 
-    # Dtypes (as strings for readability)
-    dtypes = {str(c): str(dt) for c, dt in df.dtypes.items()}
+    # nulls
+    nulls = {str(c): int(v) for c, v in df.isna().sum().items()}
 
-    # Null counts
-    nulls = {str(c): int(df[c].isna().sum()) for c in df.columns}
-
-    # Numeric summary (mimic pandas describe)
-    numeric = df.select_dtypes(include="number")
+    # numeric summary
+    numeric_cols = df.select_dtypes(include="number")
     numeric_summary: Dict[str, Dict[str, Any]] = {}
-    if not numeric.empty:
-        desc = numeric.describe(percentiles=[0.25, 0.5, 0.75]).to_dict()
-        # Reorganize to {col: {count:..., mean:..., ...}}
-        wanted = ["count", "mean", "std", "min", "25%", "50%", "75%", "max"]
-        for col in desc:
-            numeric_summary[col] = {k: _maybe_round(desc[col].get(k)) for k in wanted}
+    if not numeric_cols.empty:
+        desc = numeric_cols.describe().to_dict()  # keys: count, mean, std, min, 25%, 50%, 75%, max
+        # flip orientation to {col: {metric: value}}
+        for metric, per_col in desc.items():
+            for col, val in per_col.items():
+                numeric_summary.setdefault(str(col), {})[metric] = None if pd.isna(val) else float(val)
 
-    # Top 5 categories for non-numeric columns
+    # top-5 categories for object-like columns
     top5_categories: Dict[str, Dict[str, int]] = {}
-    cat_df = df.select_dtypes(exclude="number")
-    for col in cat_df.columns:
-        vc = cat_df[col].astype(str).value_counts().head(5)
+    for col in df.select_dtypes(include=["object", "category"]).columns:
+        vc = df[col].astype("string").value_counts().head(5)
         top5_categories[str(col)] = {str(k): int(v) for k, v in vc.items()}
 
     return {
         "shape": shape,
         "columns": columns,
-        "dtypes": dtypes,
         "nulls": nulls,
         "numeric_summary": numeric_summary,
         "top5_categories": top5_categories,
     }
 
-def _maybe_round(x):
-    if x is None:
-        return None
-    try:
-        f = float(x)
-        # round to 6 to preserve fidelity; front-end re-formats
-        return round(f, 6)
-    except Exception:
-        return x
-
-
-# --------- Routes ---------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-@app.post("/analytics/upload")
-def analytics_upload(file: UploadFile = File(...)):
-    """
-    Save the uploaded file and return a dataset_id.
-    """
-    dataset_id = _save_upload(file)
-    return {"dataset_id": dataset_id, "filename": file.filename}
-
-@app.get("/analytics/profile")
-def analytics_profile(dataset_id: str = Query(..., description="dataset_id returned by /analytics/upload")):
-    """
-    Load the dataset by id and return a profiling summary compatible with lab.html.
-    """
-    df = _load_dataframe(dataset_id)
-    profile = _profile_dataframe(df)
-    return profile
-
-
-# For running locally:  uvicorn guardrail_api:app --reload --port 8001
-# (Render will run with its own command)
+# ---------- optional root to avoid 'Not Found' at '/' ----------
+@app.get("/")
+def root():
+    return {"message": "DAFE API. Try /health or /analytics/*"}
