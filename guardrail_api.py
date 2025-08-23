@@ -1,7 +1,7 @@
 import io
-import os
 import re
 import uuid
+from datetime import datetime
 from typing import Dict, Any, List
 
 import numpy as np
@@ -9,271 +9,288 @@ import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-# -----------------------------------------------------------------------------
-# App & CORS
-# -----------------------------------------------------------------------------
-app = FastAPI(title="Reverie Analytics API", version="0.2.0")
+# -----------------------------
+# Service setup
+# -----------------------------
+app = FastAPI(title="Reverie Analytics API")
 
-ALLOWED_ORIGINS = [
-    "https://www.reveriesun.com",
-    "https://reveriesun.com",
-    # keep your temporary Netlify subdomain(s) while testing:
-    "https://inspiring-tarsier-97b2c7.netlify.app",
-]
+# Allow your frontends to call this API from the browser
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=[
+        "https://www.reveriesun.com",
+        "https://reveriesun.com",
+        "https://reveriesun.netlify.app",
+        "https://inspiring-tarsier-97b2c7.netlify.app",
+        "http://localhost:5173",  # local dev
+        "http://localhost:8080",
+        "http://127.0.0.1:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
-# In-memory storage (ephemeral)
-# -----------------------------------------------------------------------------
-_DATASETS: Dict[str, pd.DataFrame] = {}
+# In-memory storage (stateless hosting keeps this lightweight)
+_STORAGE: Dict[str, pd.DataFrame] = {}
 
-# -----------------------------------------------------------------------------
-# Helpers: missing values, numeric & date coercion
-# -----------------------------------------------------------------------------
-_MISSING_PATTERNS = [
-    r"^\s*$",     # empty/whitespace
-    r"^na$", r"^n/a$", r"^none$", r"^null$", r"^nil$",
-    r"^-$", r"^--$",
-]
-_MISSING_REGEX = re.compile("|".join(_MISSING_PATTERNS), re.IGNORECASE)
+# Regex helpers for numeric cleaning
+_CURRENCY_CHARS = re.compile(r"[€£$]")
+_GROUPING_CHARS = re.compile(r"[,_ ]")
 
-def standardize_missing(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert empty/placeholder strings to NaN across all object/string columns."""
-    obj_cols = df.select_dtypes(include=["object", "string"]).columns
-    if len(obj_cols):
-        df[obj_cols] = df[obj_cols].applymap(
-            lambda x: np.nan if isinstance(x, str) and _MISSING_REGEX.match(x) else x
-        )
-    return df
+# -----------------------------
+# Small utilities
+# -----------------------------
+def sniff_delimiter(text: str) -> str:
+    if "\t" in text:
+        return "\t"
+    # choose the most frequent of ; or ,
+    comma = text.count(",")
+    semi = text.count(";")
+    return ";" if semi > comma else ","
 
-# currency/commas/% cleanup
-def _clean_numeric_str(x: Any) -> Any:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return np.nan
-    if isinstance(x, (int, float)):
-        return float(x)
-    if not isinstance(x, str):
-        return np.nan
-
-    s = x.strip()
-    if not s:
-        return np.nan
-
-    # parentheses negatives e.g. (1,234.56)
-    neg = s.startswith("(") and s.endswith(")")
-    s = s.replace("−", "-")  # U+2212 to ASCII hyphen
-
-    # keep digits, decimal, minus
-    s_num = re.sub(r"[^0-9.\-]", "", s)
-    try:
-        val = float(s_num) if s_num not in ("", "-", ".") else np.nan
-    except Exception:
-        val = np.nan
-    if neg and not (isinstance(val, float) and np.isnan(val)):
-        val = -val
-    return val
-
-def to_numeric_clean(series: pd.Series) -> pd.Series:
-    """Return a numeric series by cleaning strings like '$1,234' or '93.2%'.
-       Works for object/string/numeric series. Always returns float dtype."""
-    if pd.api.types.is_numeric_dtype(series):
-        return pd.to_numeric(series, errors="coerce").astype(float)
-    if pd.api.types.is_string_dtype(series) or series.dtype == "object":
-        return series.map(_clean_numeric_str).astype(float)
-    # anything else -> try numeric
-    return pd.to_numeric(series, errors="coerce").astype(float)
-
-def coerce_numeric_columns(df: pd.DataFrame, min_convertible: float = 0.6) -> pd.DataFrame:
-    """Convert object-like columns to numeric if ≥ min_convertible fraction parse OK."""
-    for col in df.columns:
-        s = df[col]
-        if pd.api.types.is_numeric_dtype(s):
-            continue
-        if pd.api.types.is_datetime64_any_dtype(s):
-            continue
-        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
-            converted = to_numeric_clean(s)
-            frac = converted.notna().mean()
-            if frac >= min_convertible and converted.notna().sum() > 0:
-                df[col] = converted
-    return df
-
-def coerce_datetime_columns(df: pd.DataFrame, min_convertible: float = 0.6) -> pd.DataFrame:
-    """Convert object-like columns to datetime if ≥ min_convertible parse OK."""
-    for col in df.columns:
-        s = df[col]
-        if pd.api.types.is_datetime64_any_dtype(s) or pd.api.types.is_numeric_dtype(s):
-            continue
-        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
-            parsed = pd.to_datetime(s, errors="coerce", utc=False)
-            frac = parsed.notna().mean()
-            if frac >= min_convertible and parsed.notna().sum() > 0:
-                df[col] = parsed.dt.tz_localize(None)
-    return df
-
-# -----------------------------------------------------------------------------
-# File readers
-# -----------------------------------------------------------------------------
-def _read_text(file_bytes: bytes) -> str:
-    try:
-        return file_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        return file_bytes.decode("latin1", errors="ignore")
-
-def read_upload_to_df(upload: UploadFile) -> pd.DataFrame:
+def load_table(upload: UploadFile) -> pd.DataFrame:
     name = (upload.filename or "").lower()
-    ext = os.path.splitext(name)[1]
+    raw = upload.file.read()
 
-    # Excel
-    if ext in {".xlsx", ".xls"}:
-        return pd.read_excel(upload.file)
+    if name.endswith((".xlsx", ".xls")):
+        # Excel
+        return pd.read_excel(io.BytesIO(raw))
+    # CSV / TXT
+    text = raw.decode("utf-8", errors="ignore")
+    delim = sniff_delimiter(text)
+    # for odd delimiters, prefer python engine
+    engine = "python" if len(delim) > 1 else "c"
+    return pd.read_csv(io.StringIO(text), sep=delim, engine=engine)
 
-    # CSV/TXT/TSV
-    file_bytes = upload.file.read()
-    text = _read_text(file_bytes)
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    cols = (
+        pd.Series(df.columns)
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\s+", "_", regex=True)
+        .str.replace(r"[^\w]+", "_", regex=True)
+    )
+    # ensure uniqueness
+    seen = {}
+    out = []
+    for c in cols:
+        if c not in seen:
+            seen[c] = 1
+            out.append(c)
+        else:
+            seen[c] += 1
+            out.append(f"{c}_{seen[c]}")
+    df.columns = out
+    return df
 
-    if ext == ".tsv":
-        return pd.read_csv(io.StringIO(text), sep="\t")
+def to_datetime_guess(s: pd.Series) -> pd.Series:
+    # robust parse, no deprecated infer flag
+    parsed = pd.to_datetime(s, errors="coerce", utc=False)
+    return parsed
 
-    # sep=None lets pandas sniff; engine='python' for flexibility
-    return pd.read_csv(io.StringIO(text), sep=None, engine="python")
+def maybe_numeric_series(s: pd.Series) -> pd.Series:
+    """Try converting an object-like column to numeric in a safe, vectorized way.
+    Only adopt conversion if it succeeds for a healthy fraction of rows."""
+    if pd.api.types.is_numeric_dtype(s):
+        return s
 
-# -----------------------------------------------------------------------------
-# Profiling logic
-# -----------------------------------------------------------------------------
-def numeric_summary(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    out: Dict[str, Dict[str, float]] = {}
-    num = df.select_dtypes(include="number")
-    for c in num.columns:
-        s = num[c].dropna()
-        if s.empty:
-            continue
-        stats = {
-            "count": float(len(s)),
-            "mean": float(s.mean()),
-            "std": float(s.std(ddof=1)) if len(s) > 1 else float("nan"),
-            "min": float(s.min()),
-            "25%": float(s.quantile(0.25)),
-            "50%": float(s.quantile(0.50)),
-            "75%": float(s.quantile(0.75)),
-            "max": float(s.max()),
-        }
-        # round nicely
-        for k in list(stats.keys()):
-            if pd.isna(stats[k]):
-                continue
-            stats[k] = float(np.round(stats[k], 2))
-        out[c] = stats
-    return out
+    if not pd.api.types.is_object_dtype(s) and not pd.api.types.is_string_dtype(s):
+        return s
 
-_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    st = s.astype(str).str.strip()
+    st = st.replace(r"^\s*$", pd.NA, regex=True)        # empty/whitespace -> NaN
+    st = st.str.replace(_CURRENCY_CHARS, "", regex=True)
+    st = st.str.replace(_GROUPING_CHARS, "", regex=True)
+    st = st.str.replace(r"^\(([^)]*)\)$", r"-\1", regex=True)  # (123) -> -123
 
-def date_summary(df: pd.DataFrame) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    dt = df.select_dtypes(include="datetime")
-    for c in dt.columns:
-        s = dt[c].dropna()
-        if s.empty:
-            continue
-        mn, mx = s.min(), s.max()
-        span = int((mx - mn).days)
-        by_month = s.dt.to_period("M").astype(str).value_counts().sort_index()
-        by_wd = s.dt.day_name().value_counts()
-        # include zeroes for missing weekdays
-        by_wd_full = {wd: int(by_wd.get(wd, 0)) for wd in _WEEKDAYS}
-        out[c] = {
-            "min": str(mn.date()),
-            "max": str(mx.date()),
-            "span_days": span,
-            "by_month": {k: int(v) for k, v in by_month.items()},
-            "by_weekday": by_wd_full,
-        }
-    return out
+    nums = pd.to_numeric(st, errors="coerce")
+    ok_ratio = nums.notna().mean()
+    # adopt conversion if >60% of non-null rows convert cleanly OR there were few non-numeric strings
+    if ok_ratio >= 0.60:
+        return nums
+    return s
 
-def top5_categories(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
-    out: Dict[str, Dict[str, int]] = {}
+def coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for c in df.columns:
+        df[c] = maybe_numeric_series(df[c])
+    return df
+
+def detect_types(df: pd.DataFrame) -> Dict[str, str]:
+    types = {}
     for c in df.columns:
         s = df[c]
-        # skip numeric and datetime columns
-        if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_datetime64_any_dtype(s):
-            continue
-        # only meaningful for small cardinality
-        vc = s.dropna().astype(str).str.strip()
-        if vc.empty:
-            continue
-        freq = vc.value_counts().head(5)
-        if not freq.empty:
-            out[c] = {k: int(v) for k, v in freq.items()}
+        if pd.api.types.is_datetime64_any_dtype(s):
+            types[c] = "date"
+        elif pd.api.types.is_numeric_dtype(s):
+            types[c] = "numeric"
+        else:
+            # treat as date if converting yields many valid values
+            candidate = to_datetime_guess(s)
+            if candidate.notna().mean() >= 0.70:
+                df[c] = candidate
+                types[c] = "date"
+                continue
+            # categorical heuristic: small unique set relative to rows
+            nunq = s.dropna().nunique()
+            if nunq <= max(20, int(len(s) * 0.2)):
+                types[c] = "category"
+            else:
+                types[c] = "text"
+    return types
+
+def round_num(x: Any, ndigits: int = 2):
+    if pd.isna(x):
+        return None
+    if isinstance(x, (int, np.integer)):
+        return int(x)
+    if isinstance(x, (float, np.floating)):
+        return round(float(x), ndigits)
+    return x
+
+def null_counts(df: pd.DataFrame) -> Dict[str, int]:
+    out = {}
+    for c in df.columns:
+        s = df[c]
+        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+            out[c] = int(s.astype(str).str.strip().replace(r"^\s*$", pd.NA, regex=True).isna().sum())
+        else:
+            out[c] = int(s.isna().sum())
     return out
 
-def df_preview(df: pd.DataFrame, limit: int = 10) -> Dict[str, Any]:
-    rows = df.head(limit).to_dict(orient="records")
-    cols = list(df.columns)
-    return {"preview": rows, "preview_columns": cols}
+def numeric_summary(df: pd.DataFrame, schema: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    numeric_cols = [c for c, t in schema.items() if t == "numeric"]
+    for c in numeric_cols:
+        desc = df[c].describe(percentiles=[0.25, 0.5, 0.75])
+        result[c] = {
+            "count": round_num(desc.get("count"), 0),
+            "mean": round_num(desc.get("mean")),
+            "std": round_num(desc.get("std")),
+            "min": round_num(desc.get("min")),
+            "25%": round_num(desc.get("25%")),
+            "50%": round_num(desc.get("50%")),
+            "75%": round_num(desc.get("75%")),
+            "max": round_num(desc.get("max")),
+        }
+    return result
 
-def profile_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
-    # standardize empties/NA placeholders
-    df = standardize_missing(df.copy())
+def date_summaries(df: pd.DataFrame, schema: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for c, t in schema.items():
+        if t != "date":
+            continue
+        s = pd.to_datetime(df[c], errors="coerce")
+        if s.notna().sum() == 0:
+            continue
+        s_valid = s.dropna()
+        by_month = (
+            s_valid.dt.to_period("M").astype(str).value_counts().sort_index().to_dict()
+        )
+        by_weekday = (
+            s_valid.dt.day_name().value_counts().reindex(
+                ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+                fill_value=0,
+            ).to_dict()
+        )
+        out[c] = {
+            "min": s_valid.min().strftime("%Y-%m-%d"),
+            "max": s_valid.max().strftime("%Y-%m-%d"),
+            "span_days": int((s_valid.max() - s_valid.min()).days),
+            "by_month": by_month,
+            "by_weekday": by_weekday,
+        }
+    return out
 
-    # try date & numeric coercions (order helps avoid bad numeric over strings that are dates)
-    df = coerce_datetime_columns(df)
-    df = coerce_numeric_columns(df)
+def top_categories(df: pd.DataFrame, schema: Dict[str, str]) -> Dict[str, Dict[str, int]]:
+    out: Dict[str, Dict[str, int]] = {}
+    for c, t in schema.items():
+        if t == "category":
+            vc = df[c].astype(str).replace("nan", np.nan).dropna().value_counts().head(5)
+            out[c] = {k: int(v) for k, v in vc.items()}
+    return out
 
-    shape = {"rows": int(df.shape[0]), "columns": int(df.shape[1])}
-    cols = list(df.columns)
-
-    # null counts after cleaning
-    nulls = df.isna().sum().astype(int).to_dict()
-
-    resp: Dict[str, Any] = {
-        "shape": shape,
-        "columns": cols,
-        "nulls": nulls,
-        "numeric_summary": numeric_summary(df),
-        "date_summary": date_summary(df),
-        "top5_categories": top5_categories(df),
+def preview_payload(df: pd.DataFrame, max_rows: int = 10) -> Dict[str, Any]:
+    rows = df.head(max_rows).copy()
+    # convert datetimes to ISO strings for JSON
+    for c in rows.columns:
+        if pd.api.types.is_datetime64_any_dtype(rows[c]):
+            rows[c] = rows[c].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+    return {
+        "columns": list(map(str, rows.columns)),
+        "rows": rows.replace({np.nan: None}).to_dict(orient="records"),
+        "total_rows": int(len(df)),
+        "total_cols": int(df.shape[1]),
     }
-    resp.update(df_preview(df))
-    return resp
 
-# -----------------------------------------------------------------------------
+# -----------------------------
 # Routes
-# -----------------------------------------------------------------------------
+# -----------------------------
 @app.get("/")
-def root():
+def root() -> Dict[str, str]:
     return {"message": "Reverie Analytics API. Try /health or /analytics/*"}
 
 @app.get("/health")
-def health():
-    return {"ok": True}
+def health() -> Dict[str, str]:
+    return {"status": "ok", "ts": datetime.utcnow().isoformat() + "Z"}
 
 @app.post("/analytics/upload")
-async def upload(file: UploadFile = File(...)) -> Dict[str, str]:
-    if not file or not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided.")
+async def upload(file: UploadFile = File(...)) -> Dict[str, Any]:
     try:
-        df = read_upload_to_df(file)
-        if df is None or df.empty:
-            raise ValueError("No rows parsed.")
+        df = load_table(file)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse file: {e}")
+        raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
+
+    if df is None or df.empty:
+        raise HTTPException(status_code=400, detail="No data found in file.")
+
+    df = normalize_columns(df)
+    # Try to parse obvious dates first (vectorized)
+    for c in df.columns:
+        if pd.api.types.is_object_dtype(df[c]) or pd.api.types.is_string_dtype(df[c]):
+            # Quickly tag columns that look like ISO date-like strings
+            hint = df[c].astype(str).str.contains(r"\d{4}-\d{1,2}-\d{1,2}", regex=True, na=False).mean()
+            if hint >= 0.6:
+                parsed = to_datetime_guess(df[c])
+                if parsed.notna().mean() >= 0.6:
+                    df[c] = parsed
+
+    # Numeric coercion
+    df = coerce_numeric_columns(df)
 
     dsid = str(uuid.uuid4())
-    _DATASETS[dsid] = df
-    return {"dataset_id": dsid}
+    _ STORAGE_LIMIT = 30  # simple cap to avoid memory creep
+    _STORAGE[dsid] = df
+    if len(_STORAGE) > _ STORAGE_LIMIT:
+        # drop the oldest key
+        oldest_key = next(iter(_STORAGE))
+        _STORAGE.pop(oldest_key, None)
+
+    return {"dataset_id": dsid, "columns": list(df.columns), "rows": int(len(df))}
 
 @app.get("/analytics/profile")
 def profile(dataset_id: str) -> Dict[str, Any]:
-    if not dataset_id or dataset_id not in _DATASETS:
-        raise HTTPException(status_code=404, detail="dataset_id not found.")
-    df = _DATASETS[dataset_id]
-    try:
-        return profile_dataframe(df)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"profiling failed: {e}")
+    if dataset_id not in _STORAGE:
+        raise HTTPException(status_code=404, detail="dataset_id not found")
+
+    df = _STORAGE[dataset_id].copy()
+
+    # Re-detect/normalize (cheap insurance if upload route changes later)
+    df = normalize_columns(df)
+    df = coerce_numeric_columns(df)
+    schema = detect_types(df)
+
+    payload: Dict[str, Any] = {
+        "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "columns": list(df.columns),
+        "schema": schema,
+        "nulls": null_counts(df),
+        "numeric_summary": numeric_summary(df, schema),
+        "date_summary": date_summaries(df, schema),
+        "top5_categories": top_categories(df, schema),
+        "preview": preview_payload(df),
+        "notes": {
+            "nulls_definition": "Counts of empty, whitespace-only, or NaN values per column.",
+        },
+    }
+    return payload
