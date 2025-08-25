@@ -1,424 +1,267 @@
 # guardrail_api.py
-# Universal analytics API for arbitrary tabular uploads.
-# FastAPI + Pandas + NumPy only.
+# FastAPI service for upload + dataframe profiling
+# Dependencies: fastapi, uvicorn[standard], python-multipart, pandas, pydantic
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
-from typing import List, Dict, Optional, Literal, Any
 import pandas as pd
 import numpy as np
-import io, uuid, re
+import io
+import re
+import uuid
+from typing import Dict, Any
 
-# -----------------------------
-# App & CORS
-# -----------------------------
 app = FastAPI(title="Reverie Analytics API")
 
+# --- CORS: allow your domains + any Netlify preview site ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://www.reveriesun.com",
-        "https://reveriesun.com",
-        "https://reveriesun.netlify.app",
-        "https://inspiring-tarsier-97b2c7.netlify.app",
-        "http://localhost:5173",
-        "http://localhost:8080",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=[],  # keep empty when using regex below
+    allow_origin_regex=r"https://([a-z0-9-]+\.)?reveriesun\.com$|https://[a-z0-9-]+\.netlify\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------
-# In-memory datastore
-# -----------------------------
-_DATA: Dict[str, pd.DataFrame] = {}
+# Defensive: sometimes proxies send stray OPTIONS preflights – respond OK.
+@app.options("/{rest_of_path:path}")
+def preflight_ok(rest_of_path: str, request: Request):
+    return JSONResponse({"ok": True})
 
-# -----------------------------
-# Utilities: parsing & coercion
-# -----------------------------
-_CURRENCY_CHARS = re.compile(r"[\$\€\£\¥]")
-_GROUPING_CHARS = re.compile(r"[,_ ]")
-_PERCENT = re.compile(r"%")
-
-def to_numeric_clean(s: pd.Series) -> pd.Series:
-    # Work on string view; keep NaN if not convertible
-    st = s.astype("string")
-    # parentheses as negatives
-    st = st.str.replace(r"^\(\s*(.*)\s*\)$", r"-\1", regex=True)
-    # strip currency + grouping
-    st = st.str.replace(_CURRENCY_CHARS, "", regex=True)
-    st = st.str.replace(_GROUPING_CHARS, "", regex=True)
-    # percent to fraction
-    is_pct = st.str.contains(_PERCENT, na=False)
-    st = st.str.replace(_PERCENT, "", regex=True)
-    num = pd.to_numeric(st, errors="coerce")
-    num.loc[is_pct] = num.loc[is_pct] / 100.0
-    return num
-
-def coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for col in out.columns:
-        if pd.api.types.is_numeric_dtype(out[col]):
-            continue
-        # adopt if at least half the rows convert cleanly
-        cand = to_numeric_clean(out[col])
-        if cand.notna().mean() >= 0.5:
-            out[col] = cand
-    return out
-
-def detect_delimiter(text: str) -> str:
-    # try most common delimiters
-    cands = [",", "\t", ";", "|"]
-    counts = {d: text.count(d) for d in cands}
-    return max(counts, key=counts.get) if max(counts.values()) > 0 else ","
-
-def read_any_table(file: UploadFile) -> pd.DataFrame:
-    name = (file.filename or "").lower()
-    raw = file.file.read()
-    if not raw:
-        raise HTTPException(400, "Empty upload")
-    if name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(io.BytesIO(raw))
-    # CSV-like
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        text = raw.decode("latin-1", errors="ignore")
-    delim = detect_delimiter(text)
-    return pd.read_csv(io.StringIO(text), sep=delim, engine="python")
-
-def describe_numeric(df: pd.DataFrame, round_to: int = 2) -> Dict[str, Dict[str, float]]:
-    num_df = df.select_dtypes(include=[np.number])
-    if num_df.empty:
-        return {}
-    desc = num_df.describe(percentiles=[0.25, 0.5, 0.75]).to_dict()
-    out: Dict[str, Dict[str, float]] = {}
-    for stat, cols in desc.items():
-        for col, val in cols.items():
-            out.setdefault(col, {})[stat] = None if pd.isna(val) else (
-                round(float(val), round_to) if isinstance(val, (int, float, np.floating)) else val
-            )
-    # keep keys consistent
-    rename = {"25%": "25%", "50%": "50%", "75%": "75%", "min": "min", "max": "max", "mean": "mean", "std": "std", "count": "count"}
-    for col in list(out.keys()):
-        out[col] = {rename.get(k, k): v for k, v in out[col].items()}
-    return out
-
-def date_summary(df: pd.DataFrame) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for col in df.columns:
-        dt = pd.to_datetime(df[col], errors="coerce")
-        if dt.notna().sum() >= max(3, int(0.5 * len(dt))):  # mostly parseable
-            s = dt.dropna()
-            by_month = s.dt.to_period("M").value_counts().sort_index()
-            by_wday = s.dt.day_name().value_counts().reindex(
-                ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"], fill_value=0
-            )
-            out[col] = {
-                "min": None if s.empty else str(s.min().date()),
-                "max": None if s.empty else str(s.max().date()),
-                "span_days": None if s.empty else int((s.max() - s.min()).days),
-                "by_month": {str(k): int(v) for k, v in by_month.items()},
-                "by_weekday": {k: int(v) for k, v in by_wday.items()},
-            }
-    return out
-
-def resample_series(df: pd.DataFrame, date_col: str, value_col: str, how: str, freq: str) -> pd.Series:
-    dt = pd.to_datetime(df[date_col], errors="coerce")
-    val = pd.to_numeric(df[value_col], errors="coerce")
-    tmp = pd.DataFrame({"dt": dt, "val": val}).dropna()
-    if tmp.empty:
-        return pd.Series([], dtype=float)
-    tmp = tmp.set_index("dt").sort_index()
-    if how == "mean":
-        s = tmp["val"].resample(freq).mean()
-    elif how == "median":
-        s = tmp["val"].resample(freq).median()
-    else:
-        s = tmp["val"].resample(freq).sum()
-    # fill missing with 0 for sum, else carry NaN (chart can show gaps)
-    if how == "sum":
-        s = s.fillna(0.0)
-    return s
-
-# -----------------------------
-# Models
-# -----------------------------
-class AnalyzeRequest(BaseModel):
-    dataset_id: str
-    type: Literal[
-        "summary", "distribution", "correlation", "regression", "pivot", "preview",
-        "forecast", "control_chart", "bump"
-    ]
-    # generic params
-    columns: Optional[List[str]] = None
-    target: Optional[str] = None
-    features: Optional[List[str]] = None
-    bins: Optional[int] = 10
-    groupby: Optional[List[str]] = None
-    values: Optional[List[str]] = None
-    agg: Optional[Literal["sum","mean","count","min","max","median"]] = "sum"
-    limit: Optional[int] = 20
-    offset: Optional[int] = 0
-    round_to: Optional[int] = 2
-
-    # time-series / chart params
-    date_col: Optional[str] = None
-    value_col: Optional[str] = None
-    category_col: Optional[str] = None
-    freq: Optional[Literal["D","W","M"]] = "D"
-    horizon: Optional[int] = 7
-    method: Optional[Literal["linreg","ma"]] = "linreg"
-    ma_window: Optional[int] = 7
-    top_k: Optional[int] = 10
-
-# -----------------------------
-# Routes
-# -----------------------------
-@app.get("/")
-def root():
-    return {"message": "Reverie Analytics API. Try /health, /analytics/upload, /analytics/profile, /analytics/analyze."}
-
+# ------------------------------------------------------------------
+# Simple health + root
+# ------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
+@app.get("/")
+def root():
+    return {"message": "DAFE API. Try /health or /analytics/*"}
+
+# ------------------------------------------------------------------
+# Upload handling and in-memory dataset store
+# ------------------------------------------------------------------
+_DATASETS: Dict[str, pd.DataFrame] = {}
+
+class ProfileResponse(BaseModel):
+    shape: Dict[str, int]
+    columns: list
+    nulls: Dict[str, int]
+    numeric_summary: Dict[str, Dict[str, float]]
+    date_summary: Dict[str, Dict[str, Any]] = {}
+    top5_categories: Dict[str, Dict[str, int]] = {}
+    preview: Dict[str, Any] = {}
+
+# --- utilities -----------------------------------------------------
+
+def _read_any_table(upload: UploadFile) -> pd.DataFrame:
+    """
+    Reads CSV/TXT/XLSX/XLS. For CSV, auto-detects delimiter via pandas engine='python'.
+    """
+    name = (upload.filename or "").lower()
+    raw = upload.file.read()  # bytes
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        # Excel requires openpyxl for .xlsx; if not installed this will fail.
+        # You can add `openpyxl` to requirements.txt if you want xlsx uploads.
+        try:
+            return pd.read_excel(io.BytesIO(raw))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Excel read failed: {e}")
+
+    # default: CSV/TXT
+    # Let pandas sniff the delimiter (engine='python' allows automatic sep=None)
+    # Decode with utf-8, fall back to latin-1 for odd encodings.
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CSV read failed: {e}")
+
+    return df
+
+
+_CURRENCY_CHARS = re.compile(r"[\$,()%\s]")
+_COMMA = re.compile(r",")
+
+def to_numeric_clean_series(s: pd.Series) -> pd.Series:
+    """
+    Vectorized numeric coercion:
+    - strips currency symbols, commas, parens
+    - handles negatives in () style
+    Returns float series (NaN where not parseable).
+    """
+    if s.dtype.kind in "biufc":  # already numeric
+        return s.astype(float)
+
+    # Work on string view
+    st = s.astype("string", copy=False)
+
+    # Detect "(123.45)" -> "-123.45"
+    neg_mask = st.str.contains(r"^\s*\(.*\)\s*$", regex=True, na=False)
+    cleaned = st.str.replace(r"^\s*\((.*)\)\s*$", r"-\1", regex=True)
+
+    # Remove currency and commas
+    cleaned = cleaned.str.replace(r"[\$,%\s]", "", regex=True)
+    cleaned = cleaned.str.replace(",", "", regex=False)
+
+    out = pd.to_numeric(cleaned, errors="coerce")
+    # If we removed trailing % signs, user may expect it as actual numeric (already handled above)
+    return out.astype(float)
+
+def coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Try to convert 'object'-like columns that are actually numbers into numeric dtype.
+    We only adopt the conversion if it increases the number of non-null numeric values,
+    to avoid destroying text columns.
+    """
+    out = df.copy()
+    for col in out.columns:
+        if out[col].dtype.kind in "biufc":
+            continue
+        s = out[col]
+        try:
+            converted = to_numeric_clean_series(s)
+            # If conversion yields more valid numbers than before, keep it
+            if converted.notna().sum() >= s.notna().sum() * 0.4:  # fairly permissive
+                out[col] = converted
+        except Exception:
+            # leave as-is
+            pass
+    return out
+
+def is_date_like(s: pd.Series) -> bool:
+    """
+    Heuristic: can the majority of non-null values parse as dates?
+    """
+    if s.isna().all():
+        return False
+    try:
+        parsed = pd.to_datetime(s, errors="coerce", utc=False)
+        valid = parsed.notna().sum()
+        n = s.notna().sum()
+        return bool(n) and valid / n >= 0.6  # 60% parses as date
+    except Exception:
+        return False
+
+def numeric_summary(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    res: Dict[str, Dict[str, float]] = {}
+    for col in df.columns:
+        if df[col].dtype.kind in "biufc":
+            s = df[col].dropna().astype(float)
+            if s.empty:
+                continue
+            q = s.quantile([0.25, 0.5, 0.75])
+            res[col] = {
+                "count": float(len(s)),
+                "mean": round(float(s.mean()), 2),
+                "std": round(float(s.std(ddof=1)), 2) if len(s) > 1 else 0.0,
+                "min": round(float(s.min()), 2),
+                "25%": round(float(q.loc[0.25]), 2),
+                "50%": round(float(q.loc[0.5]), 2),
+                "75%": round(float(q.loc[0.75]), 2),
+                "max": round(float(s.max()), 2),
+            }
+    return res
+
+def date_summary(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    res: Dict[str, Dict[str, Any]] = {}
+    weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    for col in df.columns:
+        s = df[col]
+        if not is_date_like(s):
+            continue
+        parsed = pd.to_datetime(s, errors="coerce", utc=False)
+        parsed = parsed.dropna()
+        if parsed.empty:
+            continue
+        by_month = parsed.dt.to_period("M").astype(str).value_counts().sort_index()
+        by_wd = parsed.dt.day_name().value_counts()
+        # include zeros for missing weekdays
+        by_wd = {wd: int(by_wd.get(wd, 0)) for wd in weekdays}
+        res[col] = {
+            "min": str(parsed.min().date()),
+            "max": str(parsed.max().date()),
+            "span_days": int((parsed.max() - parsed.min()).days),
+            "by_month": {k: int(v) for k, v in by_month.items()},
+            "by_weekday": by_wd,
+        }
+    return res
+
+def top5_categories(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
+    res: Dict[str, Dict[str, int]] = {}
+    for col in df.columns:
+        s = df[col]
+        # skip numeric columns and strongly date-like columns
+        if s.dtype.kind in "biufc" or is_date_like(s):
+            continue
+        vc = s.astype("string", copy=False).value_counts().head(5)
+        if not vc.empty:
+            res[col] = {str(k): int(v) for k, v in vc.items()}
+    return res
+
+def preview_rows(df: pd.DataFrame, rows: int = 10) -> Dict[str, Any]:
+    head = df.head(rows)
+    return {
+        "rows": rows,
+        "columns": list(head.columns),
+        "data": head.replace({np.nan: None}).to_dict(orient="records"),
+    }
+
+# ------------------------------------------------------------------
+# Endpoints
+# ------------------------------------------------------------------
+
 @app.post("/analytics/upload")
 async def upload(file: UploadFile = File(...)):
-    df = read_any_table(file)
-    df.columns = [str(c).strip() for c in df.columns]
+    try:
+        df = _read_any_table(file)
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
+
+    # Clean up columns (strip BOM, whitespace)
+    df.columns = [str(c).encode("utf-8", "ignore").decode("utf-8").strip().strip('"').strip("'") for c in df.columns]
+    # Normalize numerics
+    df = coerce_numeric_columns(df)
+
     dataset_id = str(uuid.uuid4())
-    _DATA[dataset_id] = df
-    return {
-        "dataset_id": dataset_id,
-        "rows": int(df.shape[0]),
-        "columns": int(df.shape[1]),
-        "columns_list": list(map(str, df.columns)),
-    }
+    _DATASETS[dataset_id] = df
 
-@app.get("/analytics/profile")
-def profile(dataset_id: str, round_to: int = 2):
-    if dataset_id not in _DATA:
-        raise HTTPException(404, "dataset_id not found")
-    raw = _DATA[dataset_id]
-    df = coerce_numeric_columns(raw)
-    info = {
+    return {"dataset_id": dataset_id, "rows": int(df.shape[0]), "columns": int(df.shape[1])}
+
+@app.get("/analytics/profile", response_model=ProfileResponse)
+def profile(dataset_id: str = Query(..., description="dataset id returned by /analytics/upload")):
+    if dataset_id not in _DATASETS:
+        raise HTTPException(status_code=404, detail="dataset_id not found")
+
+    df = _DATASETS[dataset_id]
+
+    out: Dict[str, Any] = {
         "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
-        "columns": list(map(str, df.columns)),
+        "columns": list(df.columns),
         "nulls": {c: int(df[c].isna().sum()) for c in df.columns},
-        "numeric_summary": describe_numeric(df, round_to=round_to),
-        "date_summary": date_summary(raw),
-        "preview": df.head(10).to_dict(orient="records"),
+        "numeric_summary": numeric_summary(df),
+        "date_summary": date_summary(df),
+        "top5_categories": top5_categories(df),
+        "preview": preview_rows(df, rows=10),
     }
-    return info
+    return out
 
-@app.get("/analytics/describe")
-def describe(dataset_id: str):
-    if dataset_id not in _DATA:
-        raise HTTPException(404, "dataset_id not found")
-    df = _DATA[dataset_id]
-    return {
-        "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
-        "columns": list(map(str, df.columns)),
-        "dtypes": {c: str(df[c].dtype) for c in df.columns},
-        "nulls": {c: int(df[c].isna().sum()) for c in df.columns},
-    }
 
-@app.post("/analytics/analyze")
-def analyze(req: AnalyzeRequest):
-    if req.dataset_id not in _DATA:
-        raise HTTPException(404, "dataset_id not found")
-    raw = _DATA[req.dataset_id]
-    df = coerce_numeric_columns(raw)
-    r = req.round_to or 2
-
-    # -------- baseline analyses --------
-    if req.type == "summary":
-        cols = req.columns or list(df.select_dtypes(include=[np.number]).columns)
-        if not cols:
-            return {"type": "summary", "result": {}}
-        return {"type": "summary", "result": describe_numeric(df[cols], round_to=r)}
-
-    if req.type == "distribution":
-        if not req.columns or len(req.columns) != 1:
-            raise HTTPException(400, "distribution requires columns=[one numeric column]")
-        col = req.columns[0]
-        series = pd.to_numeric(df[col], errors="coerce").dropna()
-        if series.empty:
-            return {"type": "distribution", "result": {"bins": [], "edges": []}}
-        bins = req.bins or 10
-        counts, edges = np.histogram(series, bins=bins)
-        return {"type": "distribution", "result": {"bins": counts.tolist(), "edges": [round(float(x), r) for x in edges]}}
-
-    if req.type == "correlation":
-        cols = req.columns or list(df.select_dtypes(include=[np.number]).columns)
-        corr = df[cols].corr(method="pearson").round(r).replace({np.nan: None})
-        return {"type": "correlation", "result": corr.to_dict()}
-
-    if req.type == "regression":
-        if not req.target or not req.features:
-            raise HTTPException(400, "regression requires target and features")
-        y = pd.to_numeric(df[req.target], errors="coerce")
-        X = pd.DataFrame({f: pd.to_numeric(df[f], errors="coerce") for f in req.features})
-        data = pd.concat([y, X], axis=1).dropna()
-        if data.empty:
-            return {"type": "regression", "result": {"rows_used": 0, "coefficients": {}}}
-        Y = data.iloc[:, 0].values.astype(float)
-        A = data.iloc[:, 1:].values.astype(float)
-        A1 = np.c_[np.ones(A.shape[0]), A]
-        beta, *_ = np.linalg.lstsq(A1, Y, rcond=None)
-        y_hat = A1 @ beta
-        ss_res = float(np.sum((Y - y_hat) ** 2))
-        ss_tot = float(np.sum((Y - Y.mean()) ** 2))
-        r2 = 0.0 if ss_tot == 0 else (1.0 - ss_res / ss_tot)
-        coefs = {"intercept": round(float(beta[0]), r)}
-        for i, f in enumerate(req.features, start=1):
-            coefs[f] = round(float(beta[i]), r)
-        return {"type": "regression", "result": {"rows_used": int(A.shape[0]), "r2": round(r2, r), "coefficients": coefs}}
-
-    if req.type == "pivot":
-        if not req.groupby or not req.values:
-            raise HTTPException(400, "pivot requires groupby and values")
-        agg = req.agg or "sum"
-        gb = raw.groupby(req.groupby, dropna=False)[req.values].agg(agg)
-        out = gb.reset_index()
-        return {"type": "pivot", "result": {"columns": list(out.columns), "rows": out.to_dict(orient="records")}}
-
-    if req.type == "preview":
-        start = max(0, req.offset or 0)
-        end = start + max(1, req.limit or 20)
-        view = raw.iloc[start:end]
-        return {"type": "preview", "result": {"columns": list(view.columns), "rows": view.to_dict(orient="records"), "offset": start, "limit": end-start, "total": int(raw.shape[0])}}
-
-    # -------- new: time-series forecast --------
-    if req.type == "forecast":
-        if not req.date_col or not req.value_col:
-            raise HTTPException(400, "forecast requires date_col and value_col")
-        how = req.agg or "sum"
-        freq = req.freq or "D"
-        h = int(req.horizon or 7)
-        s = resample_series(raw, req.date_col, req.value_col, how, freq).dropna()
-        if len(s) < 3:
-            return {"type": "forecast", "result": {"history": [], "forecast": []}}
-        # index -> numeric x
-        x = np.arange(len(s), dtype=float)
-        y = s.values.astype(float)
-
-        if req.method == "ma":
-            # simple moving average baseline
-            w = int(req.ma_window or 7)
-            if w < 2:
-                w = 2
-            y_hat_hist = pd.Series(y).rolling(window=min(w, len(y)), min_periods=1).mean().values
-            slope = 0.0
-            intercept = float(y_hat_hist[-1])
-        else:
-            # linear regression on time
-            A = np.c_[np.ones_like(x), x]
-            beta, *_ = np.linalg.lstsq(A, y, rcond=None)
-            intercept = float(beta[0])
-            slope = float(beta[1])
-            y_hat_hist = (A @ beta)
-
-        # residual std for CI
-        resid = y - y_hat_hist
-        sd = float(np.std(resid, ddof=1)) if len(resid) > 2 else 0.0
-
-        # build future timeline
-        last_ts = s.index[-1]
-        future_idx = pd.date_range(last_ts, periods=h+1, freq=freq, inclusive="right")
-        x_future = np.arange(len(x), len(x) + len(future_idx), dtype=float)
-        y_future = intercept + slope * x_future
-        # if MA, keep flat at last MA value
-        if req.method == "ma":
-            y_future = np.full_like(x_future, fill_value=y_hat_hist[-1], dtype=float)
-
-        history = [{"ts": ts.isoformat(), "y": round(float(val), r)} for ts, val in zip(s.index, y)]
-        forecast = [{"ts": ts.isoformat(), "yhat": round(float(val), r), "lcl": round(float(val - 1.96 * sd), r), "ucl": round(float(val + 1.96 * sd), r)} for ts, val in zip(future_idx, y_future)]
-        return {"type": "forecast", "result": {"history": history, "forecast": forecast, "method": req.method, "sd": round(sd, r)}}
-
-    # -------- new: control chart (X-bar) --------
-    if req.type == "control_chart":
-        if not req.date_col or not req.value_col:
-            raise HTTPException(400, "control_chart requires date_col and value_col")
-        how = req.agg or "mean"
-        freq = req.freq or "D"
-        s = resample_series(raw, req.date_col, req.value_col, how, freq).dropna()
-        if len(s) < 3:
-            return {"type": "control_chart", "result": {"points": [], "ucl": None, "lcl": None, "mean": None}}
-        y = s.values.astype(float)
-        mu = float(np.mean(y))
-        sigma = float(np.std(y, ddof=1)) if len(y) > 1 else 0.0
-        ucl = mu + 3.0 * sigma
-        lcl = mu - 3.0 * sigma
-        pts = [{"ts": ts.isoformat(), "y": round(float(val), r), "ooc": bool(val > ucl or val < lcl)} for ts, val in zip(s.index, y)]
-        return {
-            "type": "control_chart",
-            "result": {
-                "points": pts,
-                "mean": round(mu, r),
-                "ucl": round(ucl, r),
-                "lcl": round(lcl, r),
-            },
-        }
-
-    # -------- new: bump chart (rank over time) --------
-    if req.type == "bump":
-        if not req.date_col or not req.category_col or not req.value_col:
-            raise HTTPException(400, "bump requires date_col, category_col, value_col")
-        how = req.agg or "sum"
-        freq = req.freq or "M"
-        top_k = int(req.top_k or 10)
-
-        dt = pd.to_datetime(raw[req.date_col], errors="coerce")
-        cat = raw[req.category_col].astype("string")
-        val = pd.to_numeric(raw[req.value_col], errors="coerce")
-        tmp = pd.DataFrame({"dt": dt, "cat": cat, "val": val}).dropna()
-        if tmp.empty:
-            return {"type": "bump", "result": {"periods": [], "series": {}, "max_rank": 0}}
-
-        # aggregate per period & category
-        tmp["period"] = tmp["dt"].dt.to_period(freq).dt.to_timestamp()
-        agg_df = tmp.groupby(["period", "cat"])["val"].agg({"sum": "sum", "mean": "mean", "median": "median"}.get(how, "sum")).reset_index()
-        pivot = agg_df.pivot(index="period", columns="cat", values="val").fillna(0.0).sort_index()
-
-        # choose top categories overall to keep chart readable
-        overall = pivot.sum(axis=0).sort_values(ascending=False)
-        keep = set(overall.head(top_k).index)
-        pivot = pivot.loc[:, [c for c in pivot.columns if c in keep]]
-
-        # compute ranks per period (1 = highest)
-        ranks = pivot.rank(axis=1, method="min", ascending=False)
-        max_rank = int(ranks.max().max()) if not ranks.empty else 0
-
-        periods = [ts.isoformat() for ts in ranks.index.to_list()]
-        series = {str(cat): [None if pd.isna(v) else int(v) for v in ranks[cat].tolist()] for cat in ranks.columns}
-        return {"type": "bump", "result": {"periods": periods, "series": series, "max_rank": max_rank}}
-
-    raise HTTPException(400, f"Unknown analysis type {req.type}")
-
-@app.post("/analytics/export")
-def export_csv(req: AnalyzeRequest):
-    res = analyze(req)
-    t = res.get("type")
-    data = res.get("result", {})
-    # Normalize to table for CSV
-    if t in ("pivot", "preview"):
-        cols = data.get("columns", [])
-        rows = data.get("rows", [])
-        df = pd.DataFrame(rows, columns=cols)
-    elif t == "summary":
-        rows = [{"column": col, **stats} for col, stats in data.items()]
-        df = pd.DataFrame(rows)
-    elif t == "correlation":
-        df = pd.DataFrame(data)
-    else:
-        return JSONResponse({"ok": False, "message": "CSV export available for preview/pivot/summary/correlation only."})
-    out = io.StringIO()
-    df.to_csv(out, index=False)
-    out.seek(0)
-    return StreamingResponse(iter([out.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=analysis.csv"})
+# For local debug:
+#   uvicorn guardrail_api:app --reload --port 8000
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("guardrail_api:app", host="0.0.0.0", port=8000, reload=True)
