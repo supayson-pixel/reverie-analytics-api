@@ -726,4 +726,35 @@ def list_datasets():
 @app.delete("/datasets/{dataset_id}")
 def delete_dataset(dataset_id: str):
     """Delete a dataset"""
-    if
+    if dataset_id not in DATASETS:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    
+    # Remove from aliases if present
+    alias_to_remove = None
+    for alias, dsid in ALIASES.items():
+        if dsid == dataset_id:
+            alias_to_remove = alias
+            break
+    
+    if alias_to_remove:
+        del ALIASES[alias_to_remove]
+    
+    del DATASETS[dataset_id]
+    
+    return {"message": f"Dataset {dataset_id} deleted successfully"}
+
+# --------------------------------------------------------------------------------------
+# Error Handlers
+# --------------------------------------------------------------------------------------
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    """Catch-all error handler"""
+    return {
+        "error": "Internal server error",
+        "detail": str(exc),
+        "type": type(exc).__name__
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
