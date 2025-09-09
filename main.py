@@ -489,7 +489,8 @@ def analytics_analyze(spec: AnalyzeSpec):
 
 def run_summary_analysis(df: pd.DataFrame) -> dict:
     try:
-        desc = df.describe(include="all", datetime_is_numeric=True).fillna("").to_dict()
+        # FIXED: Remove datetime_is_numeric parameter for compatibility
+        desc = df.describe(include="all").fillna("").to_dict()
         return {
             "kind": "summary",
             "shape": {"rows": len(df), "columns": df.shape[1]},
