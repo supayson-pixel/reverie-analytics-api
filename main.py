@@ -44,20 +44,20 @@ except Exception:
 # --------------------------------------------------------------------------------------
 app = FastAPI(title="Reverie Analytics API", version="1.0")
 
-# CORS - Allow your Netlify domains
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*")
 if CORS_ALLOW_ORIGINS == "*":
     allow_origins = ["*"]
 else:
     allow_origins = [o.strip() for o in CORS_ALLOW_ORIGINS.split(",")]
 
-# Add common origins
+# Add your specific Netlify domain here
 allow_origins.extend([
     "https://reveriesun.com",
     "https://www.reveriesun.com",
     "http://localhost",
     "http://localhost:3000",
-    "http://localhost:8000"
+    "http://localhost:8000",
+    "https://inspiring-tarsier-97b2c7.netlify.app/",  
 ])
 
 app.add_middleware(
