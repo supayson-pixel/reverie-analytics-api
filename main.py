@@ -283,11 +283,11 @@ def dataframe_preview(df: pd.DataFrame, rows: int = 10) -> list[dict]:
 # --------------------------------------------------------------------------------------
 # Models
 # --------------------------------------------------------------------------------------
-class UploadResponse(BaseModel):
+class AnalyzeSpec(BaseModel):
     dataset_id: str
-    rows: int
-    columns: int
-    alias: T.Optional[str] = None
+    type: str
+    x: Optional[str] = None
+    y: Optional[str] = None
 
 class ProfileResponse(BaseModel):
     shape: dict
